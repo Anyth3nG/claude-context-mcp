@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+chroma_data/
+chroma_data_smoketest/
+chroma_data_smoketest_fallback/
+.env
+review_log.jsonl

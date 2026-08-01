@@ -1,0 +1,50 @@
+# Deploys to the EC2 instance via a self-hosted runner installed on that
+# instance. The runner polls GitHub over outbound HTTPS, so the security
+# group needs no inbound rule for deploys at all — it can stay locked to
+# the known-IP allowlist for the MCP endpoint itself.
+#
+# One-time setup on the EC2 box (assumptions this workflow relies on):
+#   - runner registered with labels: self-hosted, ec2-deploy
+#   - app lives at /opt/context-mcp with a venv at /opt/context-mcp/.venv
+#   - .env and chroma_data/ live in /opt/context-mcp and are never touched here
+#   - systemd unit `context-mcp` runs the server; the runner user has a
+#     sudoers entry for exactly: /usr/bin/systemctl restart context-mcp
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ec2-deploy]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync code to app directory
+        run: |
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude '.env' \
+            --exclude '.venv' \
+            --exclude 'chroma_data' \
+            ./ /opt/context-mcp/
+
+      - name: Install dependencies
+        run: |
+          [ -d /opt/context-mcp/.venv ] || python3 -m venv /opt/context-mcp/.venv
+          /opt/context-mcp/.venv/bin/pip install -r /opt/context-mcp/requirements.txt
+
+      - name: Restart service
+        run: sudo /usr/bin/systemctl restart context-mcp
+
+      - name: Verify service is up
+        run: |
+          sleep 3
+          systemctl is-active context-mcp
