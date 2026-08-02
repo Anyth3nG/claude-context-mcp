@@ -1,0 +1,24 @@
+# Deployment bundle only — keep this list minimal.
+#
+# Lambda allows 250MB unzipped; this set lands around 110MB, which is what
+# makes a plain zip deploy possible instead of a container image. Two choices
+# do most of that work:
+#   - chromadb-client, not chromadb: HTTP-only, so no embedded database engine
+#     and no onnxruntime (~51MB). The deployed path always talks to Chroma
+#     Cloud, so the local engine would be dead weight anyway.
+#   - no voyageai: the SDK pulls pillow, tokenizers, hf_xet and aiohttp
+#     (~90MB) for features this project never touches. shared/store.py calls
+#     the same REST endpoint directly with httpx.
+#
+# Install for arm64 (Graviton), matching the function's architecture:
+#   pip install --target build --platform manylinux2014_aarch64 \
+#       --python-version 3.13 --implementation cp --only-binary=:all: \
+#       -r requirements-lambda.txt
+#
+# Do NOT strip .dist-info directories from the bundle to save space —
+# importlib.metadata reads them at runtime and imports fail without them.
+chromadb-client
+httpx
+numpy
+mcp
+mangum

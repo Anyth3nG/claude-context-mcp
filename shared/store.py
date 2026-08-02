@@ -6,7 +6,10 @@ the MCP server and the backfill script will import — logic lives here once.
 from __future__ import annotations
 import chromadb
 import hashlib
+import httpx
+import numpy as np
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -64,16 +67,130 @@ def _normalize_category(category: str) -> tuple[str, Optional[str]]:
     )
 
 
-def voyage_embedding_function(api_key: str, model: str = DEFAULT_VOYAGE_MODEL):
+VOYAGE_EMBEDDINGS_URL = "https://api.voyageai.com/v1/embeddings"
+
+
+class VoyageRestEmbedding:
     """
     Real embedding function for actual use (decision: Voyage, not local).
-    Requires `voyageai` installed and an API key. Kept as a factory function
-    so ContextStore itself doesn't hard-depend on voyageai being installed —
-    only import this if you're actually using it.
-    """
-    from chromadb.utils.embedding_functions import VoyageAIEmbeddingFunction
 
-    return VoyageAIEmbeddingFunction(api_key=api_key, model_name=model)
+    Deliberately calls Voyage's REST endpoint directly instead of using the
+    `voyageai` SDK. Same endpoint, same request, same vectors — but the SDK
+    declares pillow, tokenizers, hf_xet and aiohttp for multimodal and local
+    tokenizer features this project never touches, ~90MB of dependencies. That
+    matters because the deploy target is Lambda, where the whole bundle has to
+    fit in 250MB unzipped; dropping the SDK took it from 200MB to 110MB.
+
+    Chroma's embedding-function protocol is duck-typed — a callable taking a
+    list of texts and returning a list of vectors, plus name() — so this drops
+    straight into the (embedding_function, embedding_function_name) seam.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = DEFAULT_VOYAGE_MODEL,
+        timeout: float = 30.0,
+        max_retries: int = 4,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.max_retries = max_retries
+        # One client, reused: on Lambda this lives at module scope across warm
+        # invocations, so a per-call TLS handshake would be pure waste. It also
+        # opens no socket at construction, which is what lets SnapStart
+        # snapshot this object without freezing a dead connection into the
+        # image (no after_restore hook needed).
+        self._client = httpx.Client(timeout=timeout)
+
+    def name(self) -> str:
+        return self.model
+
+    def __call__(self, input):
+        if isinstance(input, str):
+            input = [input]
+        # A 429 raises straight out of collection.upsert()/query(), so without
+        # this a rate limit surfaces as a failed write rather than a slow one.
+        # Backoff starts at the length of a rate-limit window, not 1-2s —
+        # short retries just re-hit the same closed window. Note Voyage
+        # throttles an account with no payment method to 3 RPM regardless of
+        # tier; with one, voyage-3.5 allows 2000 RPM.
+        delay = 25.0
+        for attempt in range(self.max_retries):
+            resp = self._client.post(
+                VOYAGE_EMBEDDINGS_URL,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={"model": self.model, "input": list(input)},
+            )
+            if resp.status_code != 429 or attempt == self.max_retries - 1:
+                break
+            time.sleep(float(resp.headers.get("retry-after", delay)))
+            delay = min(delay * 2, 60.0)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        # Sort defensively rather than trusting response order — a silent
+        # misalignment here attaches the wrong vector to the wrong document
+        # and is near-impossible to debug afterwards.
+        ordered = [item["embedding"] for item in sorted(data, key=lambda d: d["index"])]
+        # MUST be numpy, not plain lists. Chroma's HTTP/Cloud client calls
+        # .tolist() on query embeddings (api/fastapi.py::_query ->
+        # convert_np_embeddings_to_list); plain lists raise AttributeError
+        # there. Writes tolerate lists and the local PersistentClient never
+        # takes that path, so this breaks ONLY on reads against Cloud.
+        return [np.array(vec, dtype=np.float32) for vec in ordered]
+
+    def embed_documents(self, input):
+        return self(input)
+
+    def embed_query(self, input):
+        return self(input)
+
+
+def _make_client(persist_path: str, use_cloud: Optional[bool] = None):
+    """
+    Chroma Cloud when the CHROMA_* trio is configured (the deployed path —
+    Lambda has no persistent disk to put a database on), local PersistentClient
+    otherwise (stdio dev, offline work).
+
+    `use_cloud` overrides the env sniffing: False forces a local store even
+    when Cloud credentials are present. Tests MUST pass False — otherwise a
+    developer with a populated .env runs the smoke suite straight into the
+    real shared store and writes fixture data into it.
+
+    Partial configuration raises rather than quietly falling back to a local
+    store: an incomplete Cloud config almost always means a deploy is
+    misconfigured, and silently writing to a local disk instead would look
+    like it worked while the entries went nowhere anyone else can read.
+
+    NOTE: PersistentClient requires the full `chromadb` package. The Lambda
+    bundle installs `chromadb-client`, which exposes the name but raises
+    "http-only client mode" on construction — so the deployed path must always
+    resolve to Cloud. See requirements.txt vs requirements-lambda.txt.
+    """
+    tenant = os.environ.get("CHROMA_TENANT")
+    database = os.environ.get("CHROMA_DATABASE")
+    api_key = os.environ.get("CHROMA_API_KEY")
+    provided = [n for n, v in
+                (("CHROMA_TENANT", tenant), ("CHROMA_DATABASE", database),
+                 ("CHROMA_API_KEY", api_key)) if v]
+
+    if use_cloud is False:
+        return chromadb.PersistentClient(path=persist_path)
+    if provided and len(provided) < 3:
+        missing = {"CHROMA_TENANT", "CHROMA_DATABASE", "CHROMA_API_KEY"} - set(provided)
+        raise RuntimeError(
+            f"Partial Chroma Cloud config: {', '.join(sorted(provided))} set but "
+            f"{', '.join(sorted(missing))} missing. Set all three to use Cloud, "
+            "or none to use a local store."
+        )
+    if use_cloud and not provided:
+        raise RuntimeError(
+            "use_cloud=True but no CHROMA_TENANT / CHROMA_DATABASE / CHROMA_API_KEY "
+            "are set."
+        )
+    if provided:
+        return chromadb.CloudClient(tenant=tenant, database=database, api_key=api_key)
+    return chromadb.PersistentClient(path=persist_path)
 
 
 class ContextStore:
@@ -83,6 +200,7 @@ class ContextStore:
         embedding_function=None,
         embedding_function_name: Optional[str] = None,
         allow_local_fallback: bool = False,
+        use_cloud: Optional[bool] = None,
     ):
         """
         Voyage is REQUIRED by default (see docs/schema.md decision) — this
@@ -98,7 +216,7 @@ class ContextStore:
         if embedding_function is None:
             api_key = os.environ.get("VOYAGE_API_KEY")
             if api_key:
-                embedding_function = voyage_embedding_function(api_key)
+                embedding_function = VoyageRestEmbedding(api_key)
                 embedding_function_name = DEFAULT_VOYAGE_MODEL
             elif allow_local_fallback:
                 embedding_function = None  # Chroma's built-in local default
@@ -120,7 +238,7 @@ class ContextStore:
                 "it and detect a mismatch if reopened differently later."
             )
 
-        self.client = chromadb.PersistentClient(path=persist_path)
+        self.client = _make_client(persist_path, use_cloud)
         self.collection = self._open_or_create_collection(
             embedding_function, embedding_function_name
         )
@@ -251,7 +369,7 @@ class _OfflineHashEmbedding:
     has no Voyage API key configured. It's a crude bag-of-words hash into a
     fixed-size vector — good enough to prove filtering + retrieval logic
     works, NOT something to actually use. On your machine, use
-    voyage_embedding_function() with a real API key instead.
+    VoyageRestEmbedding with a real API key instead.
     """
 
     def __init__(self, dim: int = 384):
@@ -263,10 +381,13 @@ class _OfflineHashEmbedding:
     def __call__(self, input):
         vectors = []
         for text in input:
-            vec = [0.0] * self.dim
+            vec = np.zeros(self.dim, dtype=np.float32)
             for word in text.lower().split():
                 h = int(hashlib.md5(word.encode()).hexdigest(), 16)
                 vec[h % self.dim] += 1.0
+            # numpy, not a list, for the same reason as VoyageRestEmbedding —
+            # otherwise this stub works locally and breaks the moment it's
+            # pointed at a Cloud collection.
             vectors.append(vec)
         return vectors
 
@@ -289,10 +410,14 @@ if __name__ == "__main__":
     # retrieval still respects boundaries, prove result truncation kicks in,
     # and prove the two embedding-function safety paths actually work
     # (mismatch guard raises; local-fallback reopen doesn't crash).
+    # use_cloud=False on every construction below: without it, a developer with
+    # Chroma Cloud credentials in .env would run this suite against the real
+    # shared store and write fixture data into it.
     store = ContextStore(
         persist_path=TEST_PATH,
         embedding_function=_OfflineHashEmbedding(),
         embedding_function_name="offline-hash-stub",
+        use_cloud=False,
     )
 
     store.save(
@@ -380,6 +505,7 @@ if __name__ == "__main__":
             persist_path=TEST_PATH,
             embedding_function=_OfflineHashEmbedding(),
             embedding_function_name="some-other-function",
+            use_cloud=False,
         )
         print("FAIL: reopening with a different embedding_function_name did not raise")
     except RuntimeError as e:
@@ -388,7 +514,9 @@ if __name__ == "__main__":
     print("\n=== Local-fallback reopen test (allow_local_fallback=True, no explicit function) ===")
     FALLBACK_PATH = "./chroma_data_smoketest_fallback"
     shutil.rmtree(FALLBACK_PATH, ignore_errors=True)
-    fallback_store = ContextStore(persist_path=FALLBACK_PATH, allow_local_fallback=True)
+    fallback_store = ContextStore(
+        persist_path=FALLBACK_PATH, allow_local_fallback=True, use_cloud=False
+    )
     fallback_store.save(
         document="Testing the local fallback embedding path.",
         category="note",
@@ -398,7 +526,9 @@ if __name__ == "__main__":
     )
     # Reopen the SAME path with allow_local_fallback again — exercises the
     # get_collection(embedding_function=None) branch, not just creation.
-    fallback_reopen = ContextStore(persist_path=FALLBACK_PATH, allow_local_fallback=True)
+    fallback_reopen = ContextStore(
+        persist_path=FALLBACK_PATH, allow_local_fallback=True, use_cloud=False
+    )
     r = fallback_reopen.search("local fallback embedding")
     print(f"Local-fallback reopen query returned: {r['documents']}")
     assert len(r["documents"][0]) >= 1, "local-fallback reopen returned no results"

@@ -63,7 +63,15 @@ default. Opting out requires an explicit `allow_local_fallback=True`. The
 collection also remembers which embedding function created it (stored in
 collection metadata as `embedding_function_name`) and refuses to reopen with
 a different one, since mixing embedding spaces silently corrupts similarity
-search with no error otherwise. See `shared/store.py::voyage_embedding_function`.
+search with no error otherwise. See `shared/store.py::VoyageRestEmbedding`.
+
+Voyage is called over its REST endpoint directly rather than through the
+`voyageai` SDK. Identical endpoint and vectors, but the SDK pulls in pillow,
+tokenizers, hf_xet and aiohttp for multimodal and local-tokenizer features
+this project never uses — ~90MB that the Lambda bundle can't afford (250MB
+unzipped limit). Embedding functions here must return **numpy arrays**, not
+plain lists: Chroma's HTTP/Cloud client calls `.tolist()` on query embeddings,
+so lists fail on reads against Cloud while working fine locally.
 
 ## Write semantics
 
