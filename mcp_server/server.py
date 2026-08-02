@@ -26,13 +26,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
+from shared.config import load_secrets
+
+from mcp_server.auth import verifier_from_env
 from mcp_server.map_routes import register_map_routes
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
-from mcp_server.tools.save_update import DESCRIPTION as SAVE_UPDATE_DESCRIPTION, save_update
+from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
+from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
 
-# python-dotenv isn't in the Lambda bundle — there's no .env there, config
-# comes from the function's environment variables. Import it optionally so the
-# same module works in both places.
+# python-dotenv isn't in the Lambda bundle — there's no .env there. Import it
+# optionally so the same module works in both places.
 try:
     from dotenv import load_dotenv
 
@@ -43,9 +46,49 @@ try:
 except ModuleNotFoundError:
     pass
 
-mcp = MCPServer("context-mcp")
+# Deployed, credentials come from Secrets Manager rather than the function's
+# own configuration — see shared/config.py for why. No-op locally. This runs at
+# import so it lands in Lambda's init phase, where it's paid once per cold
+# start rather than once per request.
+load_secrets()
+
+def _auth_settings(verifier) -> "AuthSettings | None":
+    """
+    OAuth configuration for the MCP endpoint, or None when Cognito isn't set up
+    (local stdio development).
+
+    issuer_url points at Cognito — the authorization server clients get
+    redirected to. resource_server_url identifies THIS server, and is what the
+    SDK advertises in protected-resource metadata so a client that arrives with
+    no token knows where to go and what it's authenticating against.
+    """
+    if verifier is None:
+        return None
+    from mcp.server.auth.settings import AuthSettings
+
+    host = os.environ.get("MCP_ALLOWED_HOST", "").split(",")[0].strip()
+    if not host:
+        raise RuntimeError("MCP_ALLOWED_HOST must be set when Cognito auth is enabled")
+    return AuthSettings(
+        issuer_url=verifier.issuer,
+        resource_server_url=f"https://{host}/mcp",
+        required_scopes=verifier.required_scopes or None,
+    )
+
+
+_token_verifier = verifier_from_env()
+OAUTH_ENABLED = _token_verifier is not None
+
+mcp = MCPServer(
+    "context-mcp",
+    token_verifier=_token_verifier,
+    auth=_auth_settings(_token_verifier),
+)
 mcp.add_tool(search_context, description=SEARCH_CONTEXT_DESCRIPTION)
-mcp.add_tool(save_update, description=SAVE_UPDATE_DESCRIPTION)
+# add_update appends history; change_update replaces current state. The split
+# replaces the old save_update, whose name said nothing about which it did.
+mcp.add_tool(add_update, description=ADD_UPDATE_DESCRIPTION)
+mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
 register_map_routes(mcp)  # /map + /map/data — HTTP transport only
 
 
@@ -72,23 +115,34 @@ def _transport_security() -> TransportSecuritySettings:
 
 class BearerAuthMiddleware:
     """
-    Bearer-token gate in front of the whole ASGI app.
+    Static bearer-token gate.
 
-    Deliberately wraps everything rather than sitting at the MCP layer, because
-    the /map and /map/data custom routes bypass MCP-level auth by design — and
-    /map/data serves the entire store. Anything reachable over the network has
-    to be behind this.
+    This exists because the /map and /map/data custom routes bypass MCP-level
+    auth by design, and /map/data serves the entire store — so they need their
+    own guard no matter what protects the MCP endpoint.
 
-    No-op when AUTH_TOKEN is unset, which keeps local stdio/dev usable; the
-    deploy is responsible for always setting it.
+    `guarded_prefixes` decides how much it covers:
+      - OAuth enabled  -> only /map*, because /mcp requests carry a Cognito JWT
+        that will never equal AUTH_TOKEN. Guarding /mcp here would reject every
+        legitimately authenticated OAuth request before the MCP layer saw it.
+      - OAuth disabled -> everything, which is the bearer-only deployment.
+
+    No-op when AUTH_TOKEN is unset, keeping local stdio/dev usable; the deploy
+    is responsible for always setting it.
     """
 
-    def __init__(self, app, token: str | None):
+    def __init__(self, app, token: str | None, guarded_prefixes: tuple[str, ...] | None = None):
         self.app = app
         self.token = token
+        self.guarded_prefixes = guarded_prefixes
+
+    def _guards(self, path: str) -> bool:
+        if self.guarded_prefixes is None:
+            return True
+        return any(path.startswith(p) for p in self.guarded_prefixes)
 
     async def __call__(self, scope, receive, send):
-        if self.token and scope["type"] == "http":
+        if self.token and scope["type"] == "http" and self._guards(scope.get("path", "")):
             headers = dict(scope.get("headers") or [])
             presented = headers.get(b"authorization", b"").decode()
             # compare_digest, not ==: a plain comparison short-circuits on the
@@ -112,7 +166,11 @@ def build_asgi_app():
         json_response=True,
         transport_security=_transport_security(),
     )
-    return BearerAuthMiddleware(app, os.environ.get("AUTH_TOKEN"))
+    # With OAuth on, MCP guards /mcp itself and the static token covers only the
+    # map routes. Without it, the static token is the only protection there is,
+    # so it covers everything.
+    prefixes = ("/map",) if OAUTH_ENABLED else None
+    return BearerAuthMiddleware(app, os.environ.get("AUTH_TOKEN"), prefixes)
 
 
 def handler(event, context):

@@ -12,4 +12,5 @@ chromadb
 httpx
 numpy
 mcp
+PyJWT
 python-dotenv

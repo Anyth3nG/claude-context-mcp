@@ -40,6 +40,38 @@ MAX_DOC_CHARS = 800
 # How close a typo must be to auto-correct (0-1, difflib ratio).
 CATEGORY_MATCH_CUTOFF = 0.75
 
+# Marks a summary that has been replaced. Archived copies keep the full text but
+# are excluded from search by default — otherwise every superseded fact stays
+# semantically searchable forever and "what do we use for vectors?" starts
+# returning last month's answer alongside this month's.
+SUPERSEDED_SOURCE = "superseded"
+
+# A replacement shorter than this fraction of the current summary is refused.
+# Catches the characteristic failure of overwrite-in-place: a caller that read a
+# four-line summary, noticed one fact changed, and sends back only that fact —
+# silently destroying the rest. Overridable, because deliberately condensing a
+# bloated summary is legitimate.
+SHRINK_GUARD_RATIO = 0.5
+
+
+class SummaryShrinkRefused(Exception):
+    """
+    Raised instead of performing a suspiciously destructive summary overwrite.
+    Carries the current content so the caller can merge rather than guess.
+    """
+
+    def __init__(self, summary_id: str, previous: str, proposed: str):
+        self.summary_id = summary_id
+        self.previous = previous
+        self.proposed = proposed
+        super().__init__(
+            f"Refusing to replace '{summary_id}': the new content is "
+            f"{len(proposed)} chars against {len(previous)} currently stored "
+            f"(under {int(SHRINK_GUARD_RATIO * 100)}%). A summary write REPLACES "
+            "the whole slot — send the complete new state, not just what changed. "
+            "Pass allow_shrink=True if the summary is genuinely being condensed."
+        )
+
 DEFAULT_VOYAGE_MODEL = "voyage-3.5"
 
 
@@ -316,12 +348,125 @@ class ContextStore:
         self.collection.upsert(ids=[id], documents=[document], metadatas=[metadata])
         return {"id": id, "corrected_from": corrected_from, **metadata}
 
+    def summary_id(self, project: Optional[str], category: str) -> str:
+        """The deterministic slot id — one living document per project+category."""
+        return f"{project or 'general'}-{category}-summary"
+
+    def get_summary(self, project: Optional[str], category: str, with_embedding: bool = False):
+        """
+        Current content of one summary slot, or None if empty.
+        Returns (document, metadata, embedding) so callers that are about to
+        overwrite can archive the old version without re-embedding it.
+        """
+        category, _ = _normalize_category(category)
+        include = ["documents", "metadatas"] + (["embeddings"] if with_embedding else [])
+        got = self.collection.get(ids=[self.summary_id(project, category)], include=include)
+        if not got["ids"]:
+            return None
+        emb = got.get("embeddings")
+        return (
+            got["documents"][0],
+            got["metadatas"][0],
+            emb[0] if with_embedding and emb is not None and len(emb) else None,
+        )
+
+    def update_summary(
+        self,
+        document: str,
+        category: str,
+        project: Optional[str] = None,
+        tier: Optional[str] = None,
+        source: str = "live",
+        chat_title: Optional[str] = None,
+        allow_shrink: bool = False,
+    ):
+        """
+        Replace one summary slot in place, archiving whatever was there.
+
+        This is the "whiteboard" write, as opposed to save(type="chunk") which
+        is the "diary". Three safeguards, because replacing is destructive in a
+        way appending never is:
+          1. The previous content is returned, so a truncating write is visible
+             immediately rather than discovered later.
+          2. A replacement far shorter than what it replaces is refused
+             (SHRINK_GUARD_RATIO).
+          3. The old version is archived as a chunk before being overwritten, so
+             nothing is ever actually lost — worst case the summary reads wrong
+             and the previous version is one query away.
+        """
+        category, corrected_from = _normalize_category(category)
+        project_key = project or "general"
+        if not project:
+            tier = None  # tier is meaningless without a project
+        elif tier and tier not in VALID_TIERS:
+            raise ValueError(f"tier must be one of {VALID_TIERS}, got '{tier}'")
+        elif not tier:
+            raise ValueError("tier is required when project is set")
+
+        sid = self.summary_id(project, category)
+        current = self.get_summary(project, category, with_embedding=True)
+
+        archived_id = None
+        previous_doc = None
+        if current is not None:
+            previous_doc, previous_meta, previous_emb = current
+
+            if not allow_shrink and len(document) < len(previous_doc) * SHRINK_GUARD_RATIO:
+                raise SummaryShrinkRefused(sid, previous_doc, document)
+
+            # Deterministic id from the content being archived, so re-running the
+            # same replacement doesn't pile up duplicate copies of one old value.
+            digest = hashlib.sha1(f"{sid}-{previous_doc}".encode()).hexdigest()[:16]
+            archived_id = f"superseded-{digest}"
+            archive_meta = {
+                **previous_meta,
+                "type": "chunk",
+                "source": SUPERSEDED_SOURCE,
+                "superseded_from": sid,
+                "superseded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            archive_kwargs = {
+                "ids": [archived_id],
+                "documents": [previous_doc],
+                "metadatas": [archive_meta],
+            }
+            # Reuse the vector Chroma already holds. Archiving therefore costs no
+            # embedding call at all — the text is unchanged, so its embedding is
+            # still exactly right.
+            if previous_emb is not None:
+                archive_kwargs["embeddings"] = [previous_emb]
+            self.collection.upsert(**archive_kwargs)
+
+        metadata = {
+            "project": project_key,
+            "category": category,
+            "type": "summary",
+            "source": source,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if tier:
+            metadata["tier"] = tier
+        if chat_title:
+            metadata["chat_title"] = chat_title
+        if corrected_from:
+            metadata["category_corrected_from"] = corrected_from
+
+        self.collection.upsert(ids=[sid], documents=[document], metadatas=[metadata])
+        return {
+            "id": sid,
+            "previous": previous_doc,
+            "archived_id": archived_id,
+            "corrected_from": corrected_from,
+            **metadata,
+        }
+
     def search(
         self,
         query: str,
         project: Optional[str] = None,  # None = search across all (incl. general)
         category: Optional[str] = None,
         top_k: int = DEFAULT_TOP_K,
+        include_superseded: bool = False,
     ):
         corrected_from = None
         if category is not None:
@@ -333,6 +478,11 @@ class ContextStore:
             where_clauses.append({"project": project})
         if category:
             where_clauses.append({"category": category})
+        if not include_superseded:
+            # Without this, archived summaries compete with live ones and stale
+            # facts resurface as if current. History stays retrievable, but only
+            # when a caller explicitly asks for it.
+            where_clauses.append({"source": {"$ne": SUPERSEDED_SOURCE}})
 
         where = None
         if len(where_clauses) == 1:

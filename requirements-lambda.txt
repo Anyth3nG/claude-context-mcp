@@ -22,3 +22,6 @@ httpx
 numpy
 mcp
 mangum
+# Cognito access-token verification. cryptography (needed for RS256) already
+# comes in via chromadb-client's dependency chain, so this adds very little.
+PyJWT
