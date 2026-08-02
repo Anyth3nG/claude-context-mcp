@@ -370,6 +370,36 @@ class ContextStore:
             emb[0] if with_embedding and emb is not None and len(emb) else None,
         )
 
+    def get_brief(self, project: Optional[str] = None) -> list[dict]:
+        """
+        Every living summary for a project, returned WHOLE — no similarity
+        ranking, no top_k, no truncation.
+
+        This exists because search() is the wrong instrument for "what is the
+        current state of X". Ranked search returns the first ~800 chars of the
+        five best-matching documents, which for long entries means most of the
+        content is unreachable no matter how the query is phrased. A brief is a
+        deterministic id lookup, so it can hand back the complete text.
+        """
+        project_key = project or "general"
+        got = self.collection.get(
+            where={"$and": [{"project": project_key}, {"type": "summary"}]},
+            include=["documents", "metadatas"],
+        )
+        entries = [
+            {
+                "category": meta.get("category"),
+                "content": doc,
+                "tier": meta.get("tier"),
+                "source": meta.get("source"),
+                "timestamp": meta.get("timestamp"),
+            }
+            for doc, meta in zip(got["documents"], got["metadatas"])
+        ]
+        # Stable, readable order rather than whatever the store returns.
+        entries.sort(key=lambda e: e["category"] or "")
+        return entries
+
     def update_summary(
         self,
         document: str,

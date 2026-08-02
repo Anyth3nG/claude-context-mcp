@@ -31,6 +31,8 @@ from shared.config import load_secrets
 from mcp_server.auth import verifier_from_env
 from mcp_server.map_routes import register_map_routes
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
+from mcp_server.tools.get_brief import DESCRIPTION as GET_BRIEF_DESCRIPTION, get_brief
+from mcp_server.tools.get_value import DESCRIPTION as GET_VALUE_DESCRIPTION, get_value
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
 from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
 
@@ -84,6 +86,10 @@ mcp = MCPServer(
     token_verifier=_token_verifier,
     auth=_auth_settings(_token_verifier),
 )
+# Read side: get_brief/get_value are deterministic lookups returning whole
+# documents; search_context ranks and truncates, so it's for history only.
+mcp.add_tool(get_brief, description=GET_BRIEF_DESCRIPTION)
+mcp.add_tool(get_value, description=GET_VALUE_DESCRIPTION)
 mcp.add_tool(search_context, description=SEARCH_CONTEXT_DESCRIPTION)
 # add_update appends history; change_update replaces current state. The split
 # replaces the old save_update, whose name said nothing about which it did.
