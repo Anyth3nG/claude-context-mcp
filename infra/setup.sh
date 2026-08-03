@@ -82,6 +82,13 @@ SECRET_NAME="context-mcp/credentials"
 LAMBDA_ROLE="context-mcp-lambda-role"
 DEPLOY_ROLE="context-mcp-deploy-role"
 GITHUB_REPO="Anyth3nG/claude-context-mcp"
+# GitHub embeds immutable numeric ids in the OIDC subject claim, so the sub is
+# "repo:OWNER@<owner_id>/REPO@<repo_id>:ref:..." and NOT "repo:OWNER/REPO:ref:...".
+# Matching on the plain name silently fails every assume with AccessDenied.
+# The ids are what makes this safe: a deleted repo name can be re-registered by
+# someone else, a repo id cannot.
+GITHUB_OWNER_ID="216859970"
+GITHUB_REPO_ID="1319082279"
 
 # How the public internet reaches the function.
 #   apigateway  (default) HTTP API v2 in front of the alias. $1.00/million
@@ -594,7 +601,9 @@ fi
 
 say "Deploy role: $DEPLOY_ROLE"
 # Trust is scoped to this repo specifically. Without the sub condition, ANY
-# GitHub repo in the world could assume this role.
+# GitHub repo in the world could assume this role. See GITHUB_OWNER_ID above for
+# why the pattern carries numeric ids rather than the repo's name.
+GITHUB_SUB="repo:${GITHUB_REPO%%/*}@${GITHUB_OWNER_ID}/${GITHUB_REPO##*/}@${GITHUB_REPO_ID}"
 TRUST=$(cat <<JSON
 {"Version":"2012-10-17","Statement":[{
   "Effect":"Allow",
@@ -602,7 +611,7 @@ TRUST=$(cat <<JSON
   "Action":"sts:AssumeRoleWithWebIdentity",
   "Condition":{
     "StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com"},
-    "StringLike":{"token.actions.githubusercontent.com:sub":"repo:${GITHUB_REPO}:*"}
+    "StringLike":{"token.actions.githubusercontent.com:sub":"${GITHUB_SUB}:*"}
   }}]}
 JSON
 )
