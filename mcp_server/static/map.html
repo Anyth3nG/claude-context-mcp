@@ -1,0 +1,706 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>context constellation</title>
+<style>
+  :root {
+    color-scheme: light dark;
+  }
+  .sky-root {
+    color-scheme: light;
+    --plane:          #f9f9f7;
+    --surface:        #fcfcfb;
+    --ink:            #0b0b0b;
+    --ink-2:          #52514e;
+    --muted:          #898781;
+    --hairline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+    --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+    --glow-opacity: 0.10;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .sky-root {
+      color-scheme: dark;
+      --plane:          #0d0d0d;
+      --surface:        #1a1a19;
+      --ink:            #ffffff;
+      --ink-2:          #c3c2b7;
+      --muted:          #898781;
+      --hairline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+      --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+      --glow-opacity: 0.16;
+    }
+  }
+  :root[data-theme="dark"] .sky-root {
+    color-scheme: dark;
+    --plane:          #0d0d0d;
+    --surface:        #1a1a19;
+    --ink:            #ffffff;
+    --ink-2:          #c3c2b7;
+    --muted:          #898781;
+    --hairline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+    --glow-opacity: 0.16;
+  }
+
+  * { margin: 0; box-sizing: border-box; }
+  .sky-root {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--plane);
+    color: var(--ink);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--hairline);
+    flex-wrap: wrap;
+  }
+  header h1 {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  #status {
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .spacer { flex: 1; }
+
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    font-size: 12px;
+    color: var(--ink-2);
+    background: none;
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 3px 10px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .chip:hover { border-color: var(--baseline); }
+  .chip.on {
+    color: var(--ink);
+    border-color: var(--ink-2);
+    font-weight: 600;
+  }
+  .btn {
+    font-size: 12px;
+    color: var(--ink-2);
+    background: none;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .btn:hover { border-color: var(--baseline); color: var(--ink); }
+
+  main { flex: 1; position: relative; min-height: 0; }
+  svg#sky { width: 100%; height: 100%; display: block; }
+
+  .link {
+    stroke: var(--baseline);
+    stroke-width: 1;
+    fill: none;
+    opacity: 0.55;
+  }
+  .hub-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    fill: var(--ink-2);
+    paint-order: stroke;
+    stroke: var(--plane);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+  }
+  .hub-count { font-size: 10px; fill: var(--muted); letter-spacing: 0.02em;
+    paint-order: stroke; stroke: var(--plane); stroke-width: 3px; }
+  .star, .hub-core { cursor: pointer; }
+  .star circle.body { transition: r 120ms ease; }
+  .star:hover circle.body { r: 8; }
+  .hit { fill: transparent; }
+
+  g.dim { opacity: 0.15; transition: opacity 200ms ease; }
+  g.lit { opacity: 1; transition: opacity 200ms ease; }
+
+  @keyframes twinkle { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+  .tw circle.body { animation: twinkle 5s ease-in-out infinite; }
+  @keyframes born {
+    0% { opacity: 0; transform: scale(0.2); }
+    60% { opacity: 1; transform: scale(1.6); }
+    100% { transform: scale(1); }
+  }
+  .born { animation: born 900ms ease-out; transform-box: fill-box; transform-origin: center; }
+  @media (prefers-reduced-motion: reduce) {
+    .tw circle.body, .born { animation: none; }
+  }
+
+  #tooltip {
+    position: fixed;
+    max-width: 340px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+    padding: 10px 12px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    pointer-events: none;
+    z-index: 10;
+    display: none;
+  }
+  #tooltip .t-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+    color: var(--ink-2);
+    font-size: 11.5px;
+  }
+  #tooltip .swatch {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex: none;
+  }
+  #tooltip .t-body { color: var(--ink); }
+  #tooltip .t-time { margin-top: 6px; color: var(--muted); font-size: 11px; }
+  .badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    padding: 0 5px;
+    color: var(--muted);
+  }
+
+  footer {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 8px 20px;
+    border-top: 1px solid var(--hairline);
+    font-size: 11.5px;
+    color: var(--ink-2);
+    flex-wrap: wrap;
+  }
+  footer .key { display: flex; align-items: center; gap: 6px; }
+  footer svg { display: block; }
+
+  #empty {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 13.5px;
+    text-align: center;
+    padding: 0 24px;
+  }
+
+  #tableWrap {
+    position: absolute;
+    inset: 0;
+    overflow: auto;
+    background: var(--plane);
+    display: none;
+    padding: 16px 20px;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12.5px;
+  }
+  th, td {
+    text-align: left;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--hairline);
+    vertical-align: top;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    position: sticky;
+    top: 0;
+    background: var(--plane);
+  }
+  td.t-content { max-width: 480px; }
+  td .swatch {
+    display: inline-block;
+    width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px;
+  }
+  td time { font-variant-numeric: tabular-nums; color: var(--ink-2); white-space: nowrap; }
+</style>
+
+<div class="sky-root">
+  <header>
+    <h1>context constellation</h1>
+    <span id="status">loading…</span>
+    <span class="spacer"></span>
+    <div class="chips" id="chips" role="group" aria-label="filter by category"></div>
+    <button class="btn" id="viewBtn" aria-pressed="false">Table</button>
+    <button class="btn" id="themeBtn" title="toggle light/dark">◐</button>
+  </header>
+  <main>
+    <svg id="sky" role="img" aria-label="Constellation map of stored context. Each labeled cluster is a project; each star is one saved entry; arms group entries by category. A table view of the same data is available via the Table button."></svg>
+    <div id="empty">No context yet.<br>The sky fills in as decisions and facts get saved.</div>
+    <div id="tableWrap" aria-label="table view of stored context"></div>
+  </main>
+  <footer>
+    <span class="key">
+      <svg width="14" height="14"><circle cx="7" cy="7" r="3.5" fill="var(--muted)"/></svg>
+      chunk — one saved moment
+    </span>
+    <span class="key">
+      <svg width="16" height="16"><circle cx="8" cy="8" r="4" fill="var(--muted)"/><circle cx="8" cy="8" r="6.5" fill="none" stroke="var(--muted)" stroke-width="1.2"/></svg>
+      summary — living distilled doc
+    </span>
+    <span class="key">
+      <svg width="26" height="14"><path d="M2 7 L24 7" stroke="var(--baseline)" stroke-width="1"/></svg>
+      arm — entries of one category, in time order
+    </span>
+    <span class="spacer"></span>
+    <span id="lastPoll" style="color:var(--muted)"></span>
+  </footer>
+</div>
+<div id="tooltip"></div>
+
+<script>
+(() => {
+  const POLL_MS = 10000;
+  const SLOT_COUNT = 8;
+  const svg = document.getElementById("sky");
+  const NS = "http://www.w3.org/2000/svg";
+  const tooltip = document.getElementById("tooltip");
+  const statusEl = document.getElementById("status");
+  const emptyEl = document.getElementById("empty");
+  const tableWrap = document.getElementById("tableWrap");
+  const chipsEl = document.getElementById("chips");
+
+  // ---- state ----
+  let entries = [];             // raw from /map/data (oldest first)
+  let nodes = [];               // sim nodes: hubs + stars
+  let links = [];               // {a, b} indices into nodes
+  let nodeById = new Map();     // entry id -> node (position persistence across polls)
+  let hubByProject = new Map();
+  let projectSlot = new Map();  // project -> color slot index (or -1 = neutral)
+  let knownIds = new Set();
+  let activeCats = new Set();   // empty = all
+  let focusProject = null;
+  let alpha = 0;
+  let tableMode = false;
+
+  const cssVar = (name) =>
+    getComputedStyle(document.querySelector(".sky-root")).getPropertyValue(name).trim();
+
+  function projectColor(project) {
+    const slot = projectSlot.get(project);
+    return slot >= 0 ? cssVar(`--series-${slot + 1}`) : cssVar("--muted");
+  }
+
+  // ---- graph construction ----
+  function assignSlots() {
+    // First-seen order over real projects; "general" and overflow stay neutral.
+    // Color follows the entity forever — never reassigned on later polls.
+    for (const e of entries) {
+      if (e.project === "general") { projectSlot.set("general", -1); continue; }
+      if (!projectSlot.has(e.project)) {
+        const used = [...projectSlot.values()].filter((s) => s >= 0).length;
+        projectSlot.set(e.project, used < SLOT_COUNT ? used : -1);
+      }
+    }
+  }
+
+  function buildGraph() {
+    assignSlots();
+    const w = svg.clientWidth, h = svg.clientHeight;
+    const cx = w / 2, cy = h / 2;
+
+    const projects = [...new Set(entries.map((e) => e.project))];
+    const oldNodes = nodeById;
+    nodes = []; links = [];
+    nodeById = new Map();
+    hubByProject = new Map();
+
+    projects.forEach((p, i) => {
+      const prev = oldNodes.get("hub:" + p);
+      const angle = (i / projects.length) * Math.PI * 2 - Math.PI / 2;
+      const hub = prev || {
+        x: cx + Math.cos(angle) * Math.min(w, h) * 0.28,
+        y: cy + Math.sin(angle) * Math.min(w, h) * 0.28,
+        vx: 0, vy: 0,
+      };
+      hub.id = "hub:" + p; hub.kind = "hub"; hub.project = p;
+      hub.entries = entries.filter((e) => e.project === p);
+      nodes.push(hub);
+      nodeById.set(hub.id, hub);
+      hubByProject.set(p, hub);
+    });
+
+    // Constellation arms: within a project, each category is a chain of
+    // stars in time order, anchored at the hub.
+    for (const p of projects) {
+      const hub = hubByProject.get(p);
+      const cats = [...new Set(hub.entries.map((e) => e.category))];
+      cats.forEach((cat, ci) => {
+        const chain = hub.entries.filter((e) => e.category === cat);
+        let parent = hub;
+        const baseAngle = (ci / cats.length) * Math.PI * 2;
+        chain.forEach((e, ei) => {
+          const prev = oldNodes.get(e.id);
+          const star = prev || {
+            x: hub.x + Math.cos(baseAngle) * (34 + ei * 30) + (Math.random() - 0.5) * 18,
+            y: hub.y + Math.sin(baseAngle) * (34 + ei * 30) + (Math.random() - 0.5) * 18,
+            vx: 0, vy: 0,
+          };
+          star.id = e.id; star.kind = "star"; star.entry = e; star.project = p;
+          nodes.push(star);
+          nodeById.set(star.id, star);
+          links.push({ a: parent, b: star, rest: parent.kind === "hub" ? 46 : 32 });
+          parent = star;
+        });
+      });
+    }
+  }
+
+  // ---- simulation ----
+  function tick() {
+    const w = svg.clientWidth, h = svg.clientHeight;
+    const cx = w / 2, cy = h / 2;
+
+    for (const n of nodes) { n.fx = 0; n.fy = 0; }
+
+    // hubs repel hubs (constellations spread out); everything repels at short range
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
+        const bothHubs = a.kind === "hub" && b.kind === "hub";
+        const range = bothHubs ? 1e9 : 8100; // short-range unless hub↔hub
+        if (d2 > range) continue;
+        const k = bothHubs ? 26000 : 900;
+        const f = Math.min(k / d2, 6);
+        const d = Math.sqrt(d2);
+        a.fx -= (dx / d) * f; a.fy -= (dy / d) * f;
+        b.fx += (dx / d) * f; b.fy += (dy / d) * f;
+      }
+    }
+    // springs along arms
+    for (const l of links) {
+      const dx = l.b.x - l.a.x, dy = l.b.y - l.a.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = (d - l.rest) * 0.03;
+      const ux = dx / d, uy = dy / d;
+      l.a.fx += ux * f; l.a.fy += uy * f;
+      l.b.fx -= ux * f; l.b.fy -= uy * f;
+    }
+    // gentle centering; keep on screen
+    for (const n of nodes) {
+      const pull = n.kind === "hub" ? 0.004 : 0.0012;
+      n.fx += (cx - n.x) * pull;
+      n.fy += (cy - n.y) * pull;
+      n.vx = (n.vx + n.fx * alpha) * 0.86;
+      n.vy = (n.vy + n.fy * alpha) * 0.86;
+      n.x += n.vx; n.y += n.vy;
+      n.x = Math.max(30, Math.min(w - 30, n.x));
+      n.y = Math.max(26, Math.min(h - 26, n.y));
+    }
+    alpha *= 0.996;
+  }
+
+  function loop() {
+    if (alpha > 0.02 && !tableMode) {
+      for (let i = 0; i < 3; i++) tick();
+      render();
+    }
+    requestAnimationFrame(loop);
+  }
+
+  // ---- rendering ----
+  let gLinks, gStars, gHubs;
+  function initSvg() {
+    svg.innerHTML = "";
+    gLinks = document.createElementNS(NS, "g");
+    gStars = document.createElementNS(NS, "g");
+    gHubs = document.createElementNS(NS, "g");
+    svg.append(gLinks, gStars, gHubs);
+    svg.addEventListener("click", (ev) => {
+      if (ev.target === svg) { focusProject = null; applyFilters(); }
+    });
+  }
+
+  function starVisible(e) {
+    return activeCats.size === 0 || activeCats.has(e.category);
+  }
+
+  function render() {
+    gLinks.innerHTML = ""; gStars.innerHTML = ""; gHubs.innerHTML = "";
+
+    for (const l of links) {
+      const line = document.createElementNS(NS, "line");
+      line.setAttribute("x1", l.a.x); line.setAttribute("y1", l.a.y);
+      line.setAttribute("x2", l.b.x); line.setAttribute("y2", l.b.y);
+      line.setAttribute("class", "link");
+      line.setAttribute("data-project", l.b.project);
+      if (!starVisible(l.b.entry ?? l.b)) line.style.opacity = "0.08";
+      gLinks.append(line);
+    }
+
+    for (const n of nodes) {
+      if (n.kind === "hub") {
+        const g = document.createElementNS(NS, "g");
+        g.setAttribute("class", "hub-core");
+        g.setAttribute("data-project", n.project);
+        const color = projectColor(n.project);
+
+        const glow = document.createElementNS(NS, "circle");
+        glow.setAttribute("cx", n.x); glow.setAttribute("cy", n.y);
+        glow.setAttribute("r", 16); glow.setAttribute("fill", color);
+        glow.setAttribute("opacity", "var(--glow-opacity)");
+        const core = document.createElementNS(NS, "circle");
+        core.setAttribute("cx", n.x); core.setAttribute("cy", n.y);
+        core.setAttribute("r", 7); core.setAttribute("fill", color);
+        const label = document.createElementNS(NS, "text");
+        label.setAttribute("x", n.x); label.setAttribute("y", n.y - 16);
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("class", "hub-label");
+        label.textContent = n.project;
+        const count = document.createElementNS(NS, "text");
+        count.setAttribute("x", n.x); count.setAttribute("y", n.y + 24);
+        count.setAttribute("text-anchor", "middle");
+        count.setAttribute("class", "hub-count");
+        count.textContent = n.entries.length;
+        const hit = document.createElementNS(NS, "circle");
+        hit.setAttribute("cx", n.x); hit.setAttribute("cy", n.y);
+        hit.setAttribute("r", 20); hit.setAttribute("class", "hit");
+
+        g.append(glow, core, label, count, hit);
+        g.addEventListener("mousemove", (ev) => showHubTip(ev, n));
+        g.addEventListener("mouseleave", hideTip);
+        g.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          focusProject = focusProject === n.project ? null : n.project;
+          applyFilters();
+        });
+        gHubs.append(g);
+      } else {
+        const e = n.entry;
+        const g = document.createElementNS(NS, "g");
+        g.setAttribute("class", "star" + (n.tw ? " tw" : "") + (n.born ? " born" : ""));
+        g.setAttribute("data-project", n.project);
+        const color = projectColor(n.project);
+        const isSummary = e.type === "summary";
+        const r = isSummary ? 5.5 : 4;
+
+        const glow = document.createElementNS(NS, "circle");
+        glow.setAttribute("cx", n.x); glow.setAttribute("cy", n.y);
+        glow.setAttribute("r", r * 2.4); glow.setAttribute("fill", color);
+        glow.setAttribute("opacity", "var(--glow-opacity)");
+        const body = document.createElementNS(NS, "circle");
+        body.setAttribute("class", "body");
+        body.setAttribute("cx", n.x); body.setAttribute("cy", n.y);
+        body.setAttribute("r", r); body.setAttribute("fill", color);
+        g.append(glow, body);
+        if (isSummary) {
+          const ring = document.createElementNS(NS, "circle");
+          ring.setAttribute("cx", n.x); ring.setAttribute("cy", n.y);
+          ring.setAttribute("r", r + 3.5); ring.setAttribute("fill", "none");
+          ring.setAttribute("stroke", color); ring.setAttribute("stroke-width", "1.3");
+          g.append(ring);
+        }
+        const hit = document.createElementNS(NS, "circle");
+        hit.setAttribute("cx", n.x); hit.setAttribute("cy", n.y);
+        hit.setAttribute("r", 14); hit.setAttribute("class", "hit");
+        g.append(hit);
+
+        if (!starVisible(e)) g.style.opacity = "0.12";
+        g.addEventListener("mousemove", (ev) => showStarTip(ev, n));
+        g.addEventListener("mouseleave", hideTip);
+        gStars.append(g);
+        n.born = false;
+      }
+    }
+    applyFocusDim();
+  }
+
+  function applyFocusDim() {
+    for (const g of [...gStars.children, ...gHubs.children, ...gLinks.children]) {
+      const p = g.getAttribute("data-project");
+      g.classList.toggle("dim", focusProject !== null && p !== focusProject);
+    }
+  }
+
+  function applyFilters() {
+    render();
+  }
+
+  // ---- tooltip ----
+  function positionTip(ev) {
+    const pad = 14;
+    tooltip.style.display = "block";
+    const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+    let x = ev.clientX + pad, y = ev.clientY + pad;
+    if (x + tw > innerWidth - 8) x = ev.clientX - tw - pad;
+    if (y + th > innerHeight - 8) y = ev.clientY - th - pad;
+    tooltip.style.left = x + "px";
+    tooltip.style.top = y + "px";
+  }
+  function fmtTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts);
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+  function showStarTip(ev, n) {
+    const e = n.entry;
+    tooltip.innerHTML = `
+      <div class="t-meta">
+        <span class="swatch" style="background:${projectColor(n.project)}"></span>
+        <strong>${esc(e.project)}</strong> · ${esc(e.category)}
+        <span class="badge">${esc(e.type)}</span>
+        <span class="badge">${esc(e.source)}</span>
+      </div>
+      <div class="t-body">${esc(e.preview)}</div>
+      <div class="t-time">${fmtTime(e.timestamp)}${e.tier ? " · " + esc(e.tier) : ""}</div>`;
+    positionTip(ev);
+  }
+  function showHubTip(ev, n) {
+    const byCat = {};
+    for (const e of n.entries) byCat[e.category] = (byCat[e.category] || 0) + 1;
+    const rows = Object.entries(byCat).map(([c, k]) => `${esc(c)} × ${k}`).join(" · ");
+    const tier = n.entries.find((e) => e.tier)?.tier;
+    tooltip.innerHTML = `
+      <div class="t-meta">
+        <span class="swatch" style="background:${projectColor(n.project)}"></span>
+        <strong>${esc(n.project)}</strong>
+        ${tier ? `<span class="badge">${esc(tier)}</span>` : ""}
+      </div>
+      <div class="t-body">${n.entries.length} entr${n.entries.length === 1 ? "y" : "ies"} · ${rows}</div>
+      <div class="t-time">click to focus this constellation</div>`;
+    positionTip(ev);
+  }
+  function hideTip() { tooltip.style.display = "none"; }
+  function esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // ---- chips / table / theme ----
+  function renderChips() {
+    const cats = [...new Set(entries.map((e) => e.category))].sort();
+    chipsEl.innerHTML = "";
+    for (const c of cats) {
+      const b = document.createElement("button");
+      b.className = "chip" + (activeCats.has(c) ? " on" : "");
+      b.textContent = c;
+      b.setAttribute("aria-pressed", activeCats.has(c));
+      b.onclick = () => {
+        activeCats.has(c) ? activeCats.delete(c) : activeCats.add(c);
+        renderChips(); applyFilters();
+      };
+      chipsEl.append(b);
+    }
+  }
+
+  function renderTable() {
+    const rows = [...entries].reverse().map((e) => `
+      <tr>
+        <td><time>${fmtTime(e.timestamp)}</time></td>
+        <td><span class="swatch" style="background:${projectColor(e.project)}"></span>${esc(e.project)}</td>
+        <td>${esc(e.category)}</td>
+        <td>${esc(e.type)}</td>
+        <td>${esc(e.source)}</td>
+        <td class="t-content">${esc(e.preview)}</td>
+      </tr>`).join("");
+    tableWrap.innerHTML = `
+      <table>
+        <thead><tr><th>When</th><th>Project</th><th>Category</th><th>Type</th><th>Source</th><th>Content</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  document.getElementById("viewBtn").onclick = function () {
+    tableMode = !tableMode;
+    this.textContent = tableMode ? "Map" : "Table";
+    this.setAttribute("aria-pressed", tableMode);
+    tableWrap.style.display = tableMode ? "block" : "none";
+    svg.style.visibility = tableMode ? "hidden" : "visible";
+    if (tableMode) renderTable();
+    else { alpha = Math.max(alpha, 0.3); }
+  };
+
+  document.getElementById("themeBtn").onclick = () => {
+    const root = document.documentElement;
+    const cur = root.getAttribute("data-theme");
+    const osDark = matchMedia("(prefers-color-scheme: dark)").matches;
+    const effective = cur || (osDark ? "dark" : "light");
+    root.setAttribute("data-theme", effective === "dark" ? "light" : "dark");
+    render(); if (tableMode) renderTable();
+  };
+
+  // ---- data ----
+  async function poll() {
+    try {
+      const res = await fetch("map/data");
+      const data = await res.json();
+      const incoming = data.entries;
+      const changed = incoming.length !== entries.length ||
+        incoming.some((e) => !knownIds.has(e.id));
+      entries = incoming;
+
+      const projects = new Set(entries.map((e) => e.project));
+      statusEl.textContent =
+        `${entries.length} entr${entries.length === 1 ? "y" : "ies"} · ${projects.size} project${projects.size === 1 ? "" : "s"}`;
+      document.getElementById("lastPoll").textContent =
+        "updated " + new Date().toLocaleTimeString();
+      emptyEl.style.display = entries.length === 0 && !tableMode ? "flex" : "none";
+
+      if (changed) {
+        buildGraph();
+        for (const n of nodes) {
+          if (n.kind === "star") {
+            if (!knownIds.has(n.id) && knownIds.size > 0) n.born = true;
+            if (!("tw" in n)) n.tw = Math.random() < 0.3;
+          }
+        }
+        knownIds = new Set(entries.map((e) => e.id));
+        for (const p of hubByProject.keys()) knownIds.add("hub:" + p);
+        renderChips();
+        if (tableMode) renderTable();
+        alpha = Math.max(alpha, 0.8);
+      }
+    } catch (err) {
+      statusEl.textContent = "connection lost — retrying";
+    }
+  }
+
+  // ---- boot ----
+  initSvg();
+  poll().then(() => { alpha = 1; });
+  setInterval(poll, POLL_MS);
+  addEventListener("resize", () => { alpha = Math.max(alpha, 0.5); });
+  loop();
+})();
+</script>

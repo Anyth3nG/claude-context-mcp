@@ -1,0 +1,140 @@
+# Deploys the MCP server to AWS Lambda.
+#
+# This replaces the previous EC2 deploy. That one needed a self-hosted runner
+# installed on the instance, because the security group only allowed inbound
+# traffic from an allowlisted IP and hosted runners have no stable IP to
+# allowlist. There is no inbound rule to satisfy any more — deploys go out to
+# the AWS API — so this runs on a normal hosted runner and authenticates with
+# OIDC instead of long-lived access keys.
+#
+# ONE-TIME SETUP this workflow assumes (none of it is created here):
+#   - Lambda function `context-mcp`, runtime python3.13, architecture arm64,
+#     handler `mcp_server.server.handler`, memory 512MB (measured: larger
+#     memory does not meaningfully improve init time), timeout ~30s.
+#   - SnapStart set to ApplyOn=PublishedVersions. This is what takes cold
+#     start from ~5.3s to ~1.5s, and it is ALSO why this workflow publishes a
+#     version and moves an alias rather than just updating $LATEST —
+#     SnapStart never applies to $LATEST.
+#   - An alias (default `live`) that clients actually point at.
+#   - Function environment variables set out-of-band (console or CLI):
+#     VOYAGE_API_KEY, CHROMA_TENANT, CHROMA_DATABASE, CHROMA_API_KEY,
+#     AUTH_TOKEN, MCP_ALLOWED_HOST. Deliberately NOT managed here, so
+#     credentials never pass through CI. MCP_ALLOWED_HOST must be the exact
+#     Function URL hostname — "*" is not a wildcard and yields HTTP 421.
+#   - An IAM role assumable by this repo via GitHub's OIDC provider, with
+#     permission to UpdateFunctionCode, PublishVersion and UpdateAlias on that
+#     function. Its ARN goes in the AWS_DEPLOY_ROLE_ARN repository secret.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required for OIDC
+  contents: read
+
+env:
+  FUNCTION_NAME: context-mcp
+  ALIAS: live
+  AWS_REGION: eu-west-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build deployment bundle
+        run: |
+          set -euo pipefail
+          # Cross-install for the function's architecture (arm64/Graviton)
+          # rather than the runner's. --only-binary=:all: makes a missing
+          # arm64 wheel fail loudly here instead of silently shipping a
+          # wrong-architecture build that only breaks at import time.
+          pip install --target build \
+            --platform manylinux2014_aarch64 \
+            --python-version 3.13 \
+            --implementation cp \
+            --only-binary=:all: \
+            -r requirements-lambda.txt
+          cp -r mcp_server shared build/
+          # __pycache__ is safe to drop. .dist-info is NOT — importlib.metadata
+          # reads it at runtime and imports fail with "No package metadata was
+          # found for <pkg>" without it.
+          find build -name '__pycache__' -type d -exec rm -rf {} + || true
+          cd build && zip -qr ../lambda.zip .
+          cd .. && ls -lh lambda.zip
+          # 250MB unzipped / 50MB zipped are the hard Lambda limits for a
+          # non-container deploy. Measured ~110MB / ~33MB, so this is a
+          # regression alarm, not a routine constraint.
+          unzipped=$(du -sm build | cut -f1)
+          echo "unzipped bundle: ${unzipped}MB"
+          [ "$unzipped" -lt 240 ] || { echo "bundle too large for zip deploy"; exit 1; }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --zip-file fileb://lambda.zip \
+            --no-cli-pager
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+      - name: Publish version
+        id: publish
+        run: |
+          version=$(aws lambda publish-version \
+            --function-name "$FUNCTION_NAME" \
+            --query Version --output text)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "published version $version"
+
+      - name: Wait for SnapStart optimization
+        run: |
+          set -euo pipefail
+          # A freshly published version sits in Pending while its snapshot is
+          # built. Pointing the alias at it before it goes Active would send
+          # traffic to a version that cannot serve yet.
+          for i in $(seq 1 40); do
+            read -r state status < <(aws lambda get-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --qualifier "${{ steps.publish.outputs.version }}" \
+              --query '[State,SnapStart.OptimizationStatus]' --output text)
+            echo "  [$i] state=$state snapstart=$status"
+            [ "$state" = "Active" ] && exit 0
+            [ "$state" = "Failed" ] && { echo "version failed to become active"; exit 1; }
+            sleep 15
+          done
+          echo "timed out waiting for version to become Active"; exit 1
+
+      - name: Point alias at the new version
+        run: |
+          aws lambda update-alias \
+            --function-name "$FUNCTION_NAME" \
+            --name "$ALIAS" \
+            --function-version "${{ steps.publish.outputs.version }}" \
+            --no-cli-pager \
+          || aws lambda create-alias \
+            --function-name "$FUNCTION_NAME" \
+            --name "$ALIAS" \
+            --function-version "${{ steps.publish.outputs.version }}" \
+            --no-cli-pager
+
+      - name: Report
+        run: |
+          echo "deployed version ${{ steps.publish.outputs.version }} to alias $ALIAS"

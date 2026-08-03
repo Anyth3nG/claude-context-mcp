@@ -1,0 +1,16 @@
+# Local development, tests, and the migration/backfill scripts.
+#
+# Full `chromadb` (not chromadb-client) because PersistentClient needs the
+# embedded database engine — the thin client exposes the name but raises
+# "http-only client mode" when you construct it. The Lambda bundle uses
+# requirements-lambda.txt instead, which is deliberately much smaller.
+#
+# No `voyageai`: Voyage is called over REST from shared/store.py, since the
+# SDK drags in ~90MB of multimodal/tokenizer dependencies this project never
+# uses. See docs/schema.md.
+chromadb
+httpx
+numpy
+mcp
+PyJWT
+python-dotenv
