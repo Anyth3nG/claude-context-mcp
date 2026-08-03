@@ -37,6 +37,14 @@ to `VALID_CATEGORIES` in `shared/store.py` — but it must be deliberate, not a
 typo that silently creates a bucket filtered queries can never find. Removing
 or renaming a category means a migration pass over existing data.
 
+The project/general grouping above is **guidance, not enforcement**:
+`VALID_CATEGORIES` is one flat set, and any category may be used with or
+without a project. It reflects where each category usually belongs, not a
+constraint the code applies. In practice `goal` is used project-scoped to hold
+a project's roadmap — which is genuinely a goal that belongs to a project — and
+`get_brief` returns every summary for a project regardless of which group its
+category nominally sits in.
+
 ## Collection structure in ChromaDB
 
 Single collection, `context_store`, for everything — summaries, chunks,
