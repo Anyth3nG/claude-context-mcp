@@ -7,3 +7,8 @@ chroma_data_smoketest/
 chroma_data_smoketest_fallback/
 .env
 review_log.jsonl
+
+# Deployment bundle built by infra/setup.sh and the CI workflow. ~110MB of
+# vendored dependencies; rebuilt on demand, never committed.
+.build/
+.build.zip
