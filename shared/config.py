@@ -21,14 +21,18 @@ import os
 SECRET_ID_VAR = "CONTEXT_MCP_SECRET_ID"
 
 # One secret holding a JSON object, not one secret per value: Secrets Manager
-# bills per secret per month, so five separate secrets would cost five times as
+# bills per secret per month, so four separate secrets would cost four times as
 # much for no benefit.
+#
+# AUTH_TOKEN used to be here. It guarded the /map routes and was accepted as a
+# fallback on /mcp; both uses are gone and the endpoint is OAuth-only, so the
+# key is no longer required. Any value still sitting in the secret is ignored —
+# extra keys are loaded into the environment but nothing reads them.
 _EXPECTED_KEYS = (
     "VOYAGE_API_KEY",
     "CHROMA_TENANT",
     "CHROMA_DATABASE",
     "CHROMA_API_KEY",
-    "AUTH_TOKEN",
 )
 
 _loaded = False
