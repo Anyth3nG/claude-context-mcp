@@ -17,10 +17,13 @@
 #     SnapStart never applies to $LATEST.
 #   - An alias (default `live`) that clients actually point at.
 #   - Function environment variables set out-of-band (console or CLI):
-#     VOYAGE_API_KEY, CHROMA_TENANT, CHROMA_DATABASE, CHROMA_API_KEY,
-#     AUTH_TOKEN, MCP_ALLOWED_HOST. Deliberately NOT managed here, so
-#     credentials never pass through CI. MCP_ALLOWED_HOST must be the exact
-#     Function URL hostname — "*" is not a wildcard and yields HTTP 421.
+#     CONTEXT_MCP_SECRET_ID, MCP_ALLOWED_HOST, COGNITO_REGION,
+#     COGNITO_USER_POOL_ID, COGNITO_ALLOWED_CLIENT_IDS, MCP_REQUIRED_SCOPES.
+#     Deliberately NOT managed here. Note none of these are credentials: the
+#     actual secrets live in Secrets Manager and are fetched at cold start by
+#     the execution role, so they pass through neither CI nor the function's
+#     configuration. MCP_ALLOWED_HOST must be the exact API Gateway hostname —
+#     "*" is not a wildcard and yields HTTP 421.
 #   - An IAM role assumable by this repo via GitHub's OIDC provider, with
 #     permission to UpdateFunctionCode, PublishVersion and UpdateAlias on that
 #     function. Its ARN goes in the AWS_DEPLOY_ROLE_ARN repository secret.

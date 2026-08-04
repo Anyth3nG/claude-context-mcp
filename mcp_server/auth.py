@@ -19,12 +19,18 @@ TOKEN SHAPE NOTE — Cognito access tokens are not ID tokens:
   - `token_use` distinguishes access from id tokens. An ID token has a valid
     signature from the same pool, so without this check an ID token would be
     accepted as an access token.
+
+OAuth is the ONLY way in. There was a static bearer fallback here, kept while
+it was unclear whether Claude Code could complete a Cognito flow (no dynamic
+registration, exact redirect-URI matching). It can — 2.1.220+ takes
+--client-id and --callback-port — so the fallback was deleted rather than
+merely switched off: it was a shared password that never expired, could not be
+revoked per device, and capped the security of the whole endpoint at its own
+strength. Do not reintroduce one. MCP_ALLOW_STATIC_TOKEN is no longer read.
 """
 from __future__ import annotations
 
-import hmac
 import os
-import time
 from typing import Optional
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -117,50 +123,6 @@ class CognitoTokenVerifier(TokenVerifier):
         )
 
 
-class StaticOrOAuthVerifier(TokenVerifier):
-    """
-    Accepts EITHER a long-lived static bearer token OR a real OAuth token.
-
-    This exists for one specific reason: Cognito has no dynamic client
-    registration and demands exact redirect-URI matches including the port,
-    while Claude Code registers dynamically and uses loopback callbacks on
-    ephemeral ports. claude.ai can use OAuth (it takes a manually-issued client
-    id/secret); Claude Code realistically cannot, without pinning a callback
-    port and having somewhere to put a pre-registered client id.
-
-    The trade being made deliberately: the static token is a shared password
-    that does not expire and cannot be revoked per-device, so overall security
-    is only as strong as that token. It is kept because the alternative is
-    Claude Code losing access to the shared store entirely. If Anthropic ships
-    request-header auth or Cognito-compatible registration, delete this class
-    and the static path with it.
-    """
-
-    def __init__(self, static_token: str, delegate: TokenVerifier, scopes: Optional[list[str]] = None):
-        self.static_token = static_token
-        self.delegate = delegate
-        self.scopes = scopes or []
-
-    async def verify_token(self, token: str) -> AccessToken | None:
-        # compare_digest, not ==: a plain comparison short-circuits on the first
-        # differing byte, leaking the token prefix through response timing.
-        if self.static_token and hmac.compare_digest(token, self.static_token):
-            return AccessToken(
-                token=token,
-                # A distinct client_id so log lines make it obvious which path
-                # authenticated a request — static tokens and OAuth sessions
-                # should never be indistinguishable after the fact.
-                client_id="static-bearer",
-                scopes=list(self.scopes),
-                # Nominal, not enforcement: every request is verified from
-                # scratch (the server is stateless), and this token genuinely
-                # has no expiry. Rotating it is a manual act.
-                expires_at=int(time.time()) + 3600,
-                subject="static-bearer",
-            )
-        return await self.delegate.verify_token(token)
-
-
 def verifier_from_env() -> Optional[TokenVerifier]:
     """
     Build a verifier from environment, or None if Cognito isn't configured —
@@ -188,26 +150,9 @@ def verifier_from_env() -> Optional[TokenVerifier]:
         )
 
     scopes = [s for s in os.environ.get("MCP_REQUIRED_SCOPES", "").split() if s]
-    cognito = CognitoTokenVerifier(
+    return CognitoTokenVerifier(
         region=region,
         user_pool_id=pool_id,
         allowed_client_ids={c.strip() for c in client_ids.split(",") if c.strip()},
         required_scopes=scopes,
     )
-
-    # The static token is accepted on the MCP endpoint only while
-    # MCP_ALLOW_STATIC_TOKEN is on. Claude Code 2.1.220+ supports --client-id
-    # and --callback-port, so it CAN do real OAuth against its own Cognito app
-    # client; once that's confirmed working, set MCP_ALLOW_STATIC_TOKEN=0 and
-    # the shared password stops granting access to the store at all (it stays
-    # in use only for the /map routes, which have no OAuth flow).
-    allow_static = os.environ.get("MCP_ALLOW_STATIC_TOKEN", "1").lower() not in ("0", "false", "no")
-    static = os.environ.get("AUTH_TOKEN")
-    if static and allow_static:
-        wrapped = StaticOrOAuthVerifier(static, cognito, scopes)
-        # issuer/required_scopes are read off the verifier by server.py when it
-        # builds AuthSettings, so the wrapper has to keep exposing them.
-        wrapped.issuer = cognito.issuer
-        wrapped.required_scopes = cognito.required_scopes
-        return wrapped
-    return cognito

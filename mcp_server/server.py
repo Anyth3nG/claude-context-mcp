@@ -12,7 +12,6 @@ MCP server entrypoint. Three ways in, one server definition:
 
 The Lambda path is the one with non-obvious constraints; see handler() below.
 """
-import hmac
 import os
 import sys
 from pathlib import Path
@@ -29,7 +28,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from shared.config import load_secrets
 
 from mcp_server.auth import verifier_from_env
-from mcp_server.map_routes import register_map_routes
+# map_routes is intentionally not imported — see the note where the tools are
+# registered below.
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
 from mcp_server.tools.get_brief import DESCRIPTION as GET_BRIEF_DESCRIPTION, get_brief
 from mcp_server.tools.get_value import DESCRIPTION as GET_VALUE_DESCRIPTION, get_value
@@ -95,7 +95,19 @@ mcp.add_tool(search_context, description=SEARCH_CONTEXT_DESCRIPTION)
 # replaces the old save_update, whose name said nothing about which it did.
 mcp.add_tool(add_update, description=ADD_UPDATE_DESCRIPTION)
 mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
-register_map_routes(mcp)  # /map + /map/data — HTTP transport only
+
+# /map and /map/data are NOT registered. Custom routes bypass MCP-level auth by
+# design, and /map/data serves the entire store — so they needed a guard of
+# their own, which was the static bearer token. That token is gone (see
+# auth.py), and these routes have no OAuth flow to fall back on: a browser
+# navigation cannot send an Authorization header, which is why the map was
+# already unreachable from a browser. Registering them now would publish the
+# whole store unauthenticated.
+#
+# map_routes.py and static/map.html are kept deliberately — they are the
+# starting point for the rebuild, where auth is designed in rather than bolted
+# on. Re-enable only together with a real browser-compatible auth path.
+# register_map_routes(mcp)
 
 
 def _transport_security() -> TransportSecuritySettings:
@@ -119,64 +131,31 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(allowed_hosts=[h.strip() for h in allowed.split(",")])
 
 
-class BearerAuthMiddleware:
-    """
-    Static bearer-token gate.
-
-    This exists because the /map and /map/data custom routes bypass MCP-level
-    auth by design, and /map/data serves the entire store — so they need their
-    own guard no matter what protects the MCP endpoint.
-
-    `guarded_prefixes` decides how much it covers:
-      - OAuth enabled  -> only /map*, because /mcp requests carry a Cognito JWT
-        that will never equal AUTH_TOKEN. Guarding /mcp here would reject every
-        legitimately authenticated OAuth request before the MCP layer saw it.
-      - OAuth disabled -> everything, which is the bearer-only deployment.
-
-    No-op when AUTH_TOKEN is unset, keeping local stdio/dev usable; the deploy
-    is responsible for always setting it.
-    """
-
-    def __init__(self, app, token: str | None, guarded_prefixes: tuple[str, ...] | None = None):
-        self.app = app
-        self.token = token
-        self.guarded_prefixes = guarded_prefixes
-
-    def _guards(self, path: str) -> bool:
-        if self.guarded_prefixes is None:
-            return True
-        return any(path.startswith(p) for p in self.guarded_prefixes)
-
-    async def __call__(self, scope, receive, send):
-        if self.token and scope["type"] == "http" and self._guards(scope.get("path", "")):
-            headers = dict(scope.get("headers") or [])
-            presented = headers.get(b"authorization", b"").decode()
-            # compare_digest, not ==: a plain comparison short-circuits on the
-            # first differing byte, which leaks the token prefix through
-            # response timing.
-            if not hmac.compare_digest(presented, f"Bearer {self.token}"):
-                await send({
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [(b"content-type", b"text/plain")],
-                })
-                await send({"type": "http.response.body", "body": b"Unauthorized"})
-                return
-        await self.app(scope, receive, send)
-
-
 def build_asgi_app():
-    """Stateless streamable-HTTP app, auth-wrapped. Fresh instance per call."""
-    app = mcp.streamable_http_app(
+    """
+    Stateless streamable-HTTP app. Fresh instance per call.
+
+    No auth wrapper here any more: /mcp is guarded by the MCP layer itself
+    against Cognito, and the only routes that ever needed a separate gate were
+    /map*, which are no longer registered.
+
+    That leaves one gap worth being loud about — if Cognito is not configured,
+    the MCP layer has nothing to verify against and this app serves the store
+    to anyone who can reach it. That is fine for loopback development and is
+    never fine anywhere else, so say so rather than failing silently.
+    """
+    if not OAUTH_ENABLED:
+        print(
+            "WARNING: serving MCP over HTTP with NO authentication — Cognito is "
+            "not configured (COGNITO_REGION / COGNITO_USER_POOL_ID / "
+            "COGNITO_ALLOWED_CLIENT_IDS). Acceptable on loopback only.",
+            file=sys.stderr,
+        )
+    return mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,
         transport_security=_transport_security(),
     )
-    # With OAuth on, MCP guards /mcp itself and the static token covers only the
-    # map routes. Without it, the static token is the only protection there is,
-    # so it covers everything.
-    prefixes = ("/map",) if OAUTH_ENABLED else None
-    return BearerAuthMiddleware(app, os.environ.get("AUTH_TOKEN"), prefixes)
 
 
 def handler(event, context):
