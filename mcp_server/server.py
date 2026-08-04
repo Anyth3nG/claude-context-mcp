@@ -27,7 +27,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from shared.config import load_secrets
 
-from mcp_server.auth import verifier_from_env
+from mcp_server.auth import REASON_NO_TOKEN, log_auth_rejection, verifier_from_env
 # map_routes is intentionally not imported — see the note where the tools are
 # registered below.
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
@@ -131,13 +131,64 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(allowed_hosts=[h.strip() for h in allowed.split(",")])
 
 
+class UnauthenticatedRejectionLogger:
+    """
+    Logs the one rejection class the token verifier never sees.
+
+    CognitoTokenVerifier.verify_token only runs once the SDK has extracted a
+    bearer token, so a request carrying no Authorization header — or one that
+    is not a Bearer credential — is refused upstream of it and would otherwise
+    be counted nowhere. That is exactly the shape of an unauthenticated probe
+    against a public endpoint, so it is the case the alarm most needs.
+
+    Scoped narrowly on purpose: it logs only when the response is a 401 AND no
+    bearer credential was present. Anything with a bearer token has already
+    been logged, with a more specific reason, by the verifier.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        auth = headers.get(b"authorization", b"").decode(errors="replace")
+        had_bearer = auth.lower().startswith("bearer ") and len(auth) > len("bearer ")
+
+        async def send_wrapper(message):
+            if (
+                not had_bearer
+                and message["type"] == "http.response.start"
+                and message["status"] == 401
+            ):
+                client = scope.get("client") or ()
+                peer = client[0] if client else headers.get(b"x-forwarded-for", b"").decode(
+                    errors="replace"
+                ).split(",")[0].strip()
+                log_auth_rejection(
+                    REASON_NO_TOKEN,
+                    # Distinguishes "sent nothing" from "sent something that
+                    # was not a Bearer credential" without recording what.
+                    "absent" if not auth else "not_bearer",
+                    path=scope.get("path", ""),
+                    peer=peer,
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
 def build_asgi_app():
     """
     Stateless streamable-HTTP app. Fresh instance per call.
 
     No auth wrapper here any more: /mcp is guarded by the MCP layer itself
     against Cognito, and the only routes that ever needed a separate gate were
-    /map*, which are no longer registered.
+    /map*, which are no longer registered. The one wrapper that remains logs
+    rejections; it never decides them.
 
     That leaves one gap worth being loud about — if Cognito is not configured,
     the MCP layer has nothing to verify against and this app serves the store
@@ -151,11 +202,12 @@ def build_asgi_app():
             "COGNITO_ALLOWED_CLIENT_IDS). Acceptable on loopback only.",
             file=sys.stderr,
         )
-    return mcp.streamable_http_app(
+    app = mcp.streamable_http_app(
         stateless_http=True,
         json_response=True,
         transport_security=_transport_security(),
     )
+    return UnauthenticatedRejectionLogger(app)
 
 
 def handler(event, context):

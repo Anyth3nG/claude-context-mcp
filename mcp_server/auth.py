@@ -35,6 +35,39 @@ from typing import Optional
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
+# One fixed, greppable marker on every rejection, whatever the cause. A
+# CloudWatch Logs metric filter matches this literal string and nothing else,
+# so the alarm keeps working even as the reason codes below grow.
+REJECT_MARKER = "CONTEXT_MCP_AUTH_REJECT"
+
+# Reason codes are a closed set, not free text: they are what makes a rejection
+# countable and what tells an expired token on a reconnect (routine) apart from
+# a client_id that was never issued (not routine).
+REASON_NO_TOKEN = "no_token"            # nothing presentable was sent at all
+REASON_INVALID_TOKEN = "invalid_token"  # signature, expiry, issuer, malformed
+REASON_WRONG_TOKEN_USE = "wrong_token_use"
+REASON_CLIENT_NOT_ALLOWED = "client_not_allowed"
+REASON_MISSING_SCOPE = "missing_scope"
+
+
+def log_auth_rejection(reason: str, detail: str = "", path: str = "", peer: str = "") -> None:
+    """
+    Emit the one line an operator (and the metric filter) sees for a rejection.
+
+    NEVER pass the presented token, any part of it, or the Authorization header
+    into `detail`. A log line outlives the request and is readable by anything
+    with CloudWatch access, so a credential logged here is a credential leaked
+    to a wider audience than the one that already had it.
+    """
+    fields = [f"{REJECT_MARKER} reason={reason}"]
+    if detail:
+        fields.append(f'detail="{detail}"')
+    if path:
+        fields.append(f"path={path}")
+    if peer:
+        fields.append(f"peer={peer}")
+    print(" ".join(fields))
+
 
 class CognitoTokenVerifier(TokenVerifier):
     """
@@ -74,11 +107,11 @@ class CognitoTokenVerifier(TokenVerifier):
             )
         return self._jwks_client
 
-    def _reject(self, reason: str) -> None:
+    def _reject(self, reason: str, detail: str = "") -> None:
         # Logged, never returned to the caller: the client gets an opaque 401,
         # because telling an unauthenticated caller *why* their token failed
         # helps an attacker more than it helps a legitimate user.
-        print(f"[auth] rejected token: {reason}")
+        log_auth_rejection(reason, detail)
         return None
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -97,21 +130,29 @@ class CognitoTokenVerifier(TokenVerifier):
                 options={"verify_aud": False, "require": ["exp", "iss", "sub"]},
             )
         except Exception as exc:  # signature, expiry, malformed, issuer mismatch
-            return self._reject(f"{type(exc).__name__}: {exc}")
+            # Type name only, never str(exc): PyJWT's messages are mostly safe
+            # ("Not enough segments"), but the class name already separates the
+            # cases that matter — ExpiredSignatureError is routine, and
+            # InvalidSignatureError is not — and it cannot echo token bytes.
+            return self._reject(REASON_INVALID_TOKEN, type(exc).__name__)
 
         if claims.get("token_use") != "access":
             # An ID token from the same pool would pass signature and issuer
             # checks, so this is load-bearing, not defensive noise.
-            return self._reject(f"token_use={claims.get('token_use')!r}, expected 'access'")
+            return self._reject(REASON_WRONG_TOKEN_USE, str(claims.get("token_use")))
 
         client_id = claims.get("client_id")
         if client_id not in self.allowed_client_ids:
-            return self._reject(f"client_id {client_id!r} not in allowed set")
+            # The client_id is safe to log — it is a public identifier, not a
+            # secret, and it is the single most useful field when the alarm
+            # fires: a valid signature from the right pool bearing an id that
+            # was never issued is a different problem from an expired token.
+            return self._reject(REASON_CLIENT_NOT_ALLOWED, str(client_id))
 
         scopes = claims.get("scope", "").split()
         missing = [s for s in self.required_scopes if s not in scopes]
         if missing:
-            return self._reject(f"missing required scopes: {missing}")
+            return self._reject(REASON_MISSING_SCOPE, ",".join(missing))
 
         return AccessToken(
             token=token,

@@ -575,6 +575,73 @@ else
 fi
 FUNCTION_URL="$PUBLIC_URL"
 
+# --- Failed-auth alerting ---------------------------------------------------
+# The endpoint is public and the repo is public, so anyone who finds the API
+# Gateway hostname can reach it. Rejections were invisible before this: refused,
+# but never counted and never surfaced. The chain is
+#   log line -> metric filter -> metric -> alarm -> SNS -> email.
+#
+# The application emits exactly one line per rejection carrying the literal
+# marker below (see mcp_server/auth.py). The filter matches that literal and
+# nothing else, so adding new reason codes never breaks the alarm.
+ALERT_TOPIC="context-mcp-alerts"
+ALERT_MARKER="CONTEXT_MCP_AUTH_REJECT"
+ALERT_NAMESPACE="ContextMcp"
+ALERT_METRIC="AuthRejections"
+ALERT_FILTER="context-mcp-auth-rejections"
+ALERT_ALARM="context-mcp-auth-rejections"
+LOG_GROUP="/aws/lambda/${FUNCTION_NAME}"
+# Threshold is a starting point, not a finding. One rejection is normal noise —
+# an expired token on a reconnect is indistinguishable from a probe at a single
+# event — so this alarms on a burst instead. Watch what the two real clients
+# generate during ordinary reconnects, then tighten.
+ALERT_THRESHOLD=5
+ALERT_PERIOD=300
+
+say "Alert topic: $ALERT_TOPIC"
+TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${ALERT_TOPIC}"
+if aws sns get-topic-attributes --topic-arn "$TOPIC_ARN" --region "$REGION" >/dev/null 2>&1; then
+  info "already exists"
+else
+  run aws sns create-topic --name "$ALERT_TOPIC" --region "$REGION" --no-cli-pager
+fi
+
+# The subscription needs confirming from the inbox — AWS will not deliver to an
+# address that has not clicked through, and an unconfirmed subscription fails
+# silently, which is the worst way for an alert to be missing.
+if aws sns list-subscriptions-by-topic --topic-arn "$TOPIC_ARN" --region "$REGION" \
+     --query "Subscriptions[?Endpoint=='${COGNITO_USER_EMAIL}'] | [0].SubscriptionArn" \
+     --output text 2>/dev/null | grep -qv '^None$'; then
+  info "already subscribed: $COGNITO_USER_EMAIL"
+else
+  run aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol email \
+    --notification-endpoint "$COGNITO_USER_EMAIL" --region "$REGION" --no-cli-pager
+  info "CONFIRM THE SUBSCRIPTION from $COGNITO_USER_EMAIL or no alert is delivered"
+fi
+
+say "Metric filter: $ALERT_FILTER"
+# defaultValue 0 so the metric reports zeros while the function is serving
+# traffic. Without it the alarm sits in INSUFFICIENT_DATA between incidents and
+# you cannot tell a quiet system from a broken filter.
+run aws logs put-metric-filter \
+  --log-group-name "$LOG_GROUP" \
+  --filter-name "$ALERT_FILTER" \
+  --filter-pattern "\"$ALERT_MARKER\"" \
+  --metric-transformations \
+    "metricName=${ALERT_METRIC},metricNamespace=${ALERT_NAMESPACE},metricValue=1,defaultValue=0" \
+  --region "$REGION"
+
+say "Alarm: $ALERT_ALARM"
+run aws cloudwatch put-metric-alarm \
+  --alarm-name "$ALERT_ALARM" \
+  --alarm-description "context-mcp: $ALERT_THRESHOLD+ rejected auth attempts in $((ALERT_PERIOD / 60)) minutes" \
+  --namespace "$ALERT_NAMESPACE" --metric-name "$ALERT_METRIC" \
+  --statistic Sum --period "$ALERT_PERIOD" --evaluation-periods 1 \
+  --threshold "$ALERT_THRESHOLD" --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions "$TOPIC_ARN" \
+  --region "$REGION" --no-cli-pager
+
 # --- GitHub Actions OIDC ----------------------------------------------------
 say "GitHub Actions OIDC provider"
 OIDC_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com"
@@ -689,8 +756,16 @@ if [ "$APPLY" = 1 ]; then
   3. Point Claude Code and the claude.ai connector at ${FUNCTION_URL}mcp
      using the OAuth client ids above.
 
-  To rotate a credential later: update the secret and the next cold start
-  picks it up. No redeploy, no new version.
+  To rotate a credential later: update the secret, THEN publish a new version
+  and move the alias. A cold start alone is not enough, and this used to say
+  otherwise. SnapStart runs the init phase once, when the version is published,
+  and every restore resumes from that snapshot — so load_secrets() reads the
+  secret at publish time, not per cold start, and the old value stays baked
+  into the running version until a new one is published.
+
+  Note that publish-version silently returns the EXISTING version when nothing
+  about \$LATEST has changed, so a secret-only rotation needs a real code or
+  configuration change to force a fresh snapshot.
 
 EOF
 else
