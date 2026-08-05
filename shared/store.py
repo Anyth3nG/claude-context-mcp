@@ -1138,12 +1138,16 @@ class ContextStore:
             self.summary_id(m.get("project"), m.get("category"), m.get("key"))
             for m in summaries["metadatas"]
         }
-        archived_only: dict[str, int] = {}
+        # Distinct ORIGINS, not archived copies. A slot rewritten five times and
+        # then archived is one archived slot, not five, and counting versions
+        # here would inflate every long-lived project.
+        archived_origins: dict[str, set] = {}
         for meta in archived["metadatas"]:
             origin = meta.get("superseded_from")
             if origin and origin not in live_ids:
                 proj = meta.get("project") or "general"
-                archived_only[proj] = archived_only.get(proj, 0) + 1
+                archived_origins.setdefault(proj, set()).add(origin)
+        archived_only = {p: len(v) for p, v in archived_origins.items()}
 
         for doc, meta in zip(summaries["documents"], summaries["metadatas"]):
             entry = slot(meta.get("project") or "general")
@@ -1174,6 +1178,14 @@ class ContextStore:
             entry["history_chunks"] += 1
             if meta.get("tier"):
                 entry.setdefault("tier", meta["tier"])
+
+        # A project whose slots were ALL archived has no live summary and may
+        # have no live chunks either, so nothing above would have created an
+        # entry for it — it would disappear from the map entirely, taking the
+        # only pointer to its history with it. Give it an entry so the archive
+        # is still findable.
+        for name in archived_only:
+            slot(name)
 
         for name, entry in projects.items():
             entry["summaries"] = dict(sorted(entry["summaries"].items()))
@@ -1776,6 +1788,20 @@ if __name__ == "__main__":
     empty = store.slot_history("hist", "tech_stack")
     assert empty["version_count"] == 0 and empty["current"] is None
     print("  a slot with no history returns cleanly rather than erroring.")
+
+    # archived_slots counts distinct slots, not archived copies. This slot has
+    # two prior versions; archiving it must add ONE, not three.
+    store.archive_slot(project="hist", category="config", key="rotation", reason="done")
+    hist_idx = store.index(project="hist")["projects"]["hist"]
+    assert hist_idx.get("archived_slots") == 1, \
+        f"expected 1 archived slot, got {hist_idx.get('archived_slots')} — counting versions, not slots"
+    assert "config/rotation" not in hist_idx["summaries"]
+    assert hist_idx["summaries"] == {}, "that was the project's only slot"
+    print("  archived_slots counts slots (1), not the 2 versions underneath it,")
+    print("  and a project with nothing live still appears, so its history stays findable.")
+    # The archived text itself must survive the slot disappearing.
+    assert store.slot_history("hist", "config", "rotation")["version_count"] == 3, \
+        "archiving adds the live value as a third version"
 
     print("\n=== archive_slot: finished work leaves the brief but stays retrievable ===")
     store.update_summary("PHASE X - do the thing. DONE, shipped as abc1234.",
