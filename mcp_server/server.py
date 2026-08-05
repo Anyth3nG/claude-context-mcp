@@ -37,6 +37,7 @@ from mcp_server.tools.get_value import DESCRIPTION as GET_VALUE_DESCRIPTION, get
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
 from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
 from mcp_server.tools.patch_context import DESCRIPTION as PATCH_CONTEXT_DESCRIPTION, patch_context
+from mcp_server.tools.retire_chunk import DESCRIPTION as RETIRE_CHUNK_DESCRIPTION, retire_chunk
 
 # python-dotenv isn't in the Lambda bundle — there's no .env there. Import it
 # optionally so the same module works in both places.
@@ -104,6 +105,12 @@ mcp.add_tool(search_context, description=SEARCH_CONTEXT_DESCRIPTION)
 mcp.add_tool(add_update, description=ADD_UPDATE_DESCRIPTION)
 mcp.add_tool(patch_context, description=PATCH_CONTEXT_DESCRIPTION)
 mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
+# Registered last because it is the rarest write and the only destructive-ish
+# one. The other three change what the store says; this one says an existing
+# entry was wrong. Chunks are append-only, so without it a disproved fact keeps
+# ranking against the entry that corrected it, with nothing marking which is
+# which — the failure the 2026-08-05 retrieval check surfaced.
+mcp.add_tool(retire_chunk, description=RETIRE_CHUNK_DESCRIPTION)
 
 # /map and /map/data are NOT registered. Custom routes bypass MCP-level auth by
 # design, and /map/data serves the entire store — so they needed a guard of
