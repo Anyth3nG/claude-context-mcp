@@ -8,6 +8,10 @@ chroma_data_smoketest_fallback/
 .env
 review_log.jsonl
 
+# Pre-rewrite snapshots written by scripts/rechunk.py. Real store contents —
+# the recovery path if a re-chunking run goes wrong, not something to commit.
+rechunk_backups/
+
 # Deployment bundle built by infra/setup.sh and the CI workflow. ~110MB of
 # vendored dependencies; rebuilt on demand, never committed.
 .build/

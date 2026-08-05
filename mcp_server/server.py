@@ -31,10 +31,12 @@ from mcp_server.auth import REASON_NO_TOKEN, log_auth_rejection, verifier_from_e
 # map_routes is intentionally not imported — see the note where the tools are
 # registered below.
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
+from mcp_server.tools.get_index import DESCRIPTION as GET_INDEX_DESCRIPTION, get_index
 from mcp_server.tools.get_brief import DESCRIPTION as GET_BRIEF_DESCRIPTION, get_brief
 from mcp_server.tools.get_value import DESCRIPTION as GET_VALUE_DESCRIPTION, get_value
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
 from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
+from mcp_server.tools.patch_context import DESCRIPTION as PATCH_CONTEXT_DESCRIPTION, patch_context
 
 # python-dotenv isn't in the Lambda bundle — there's no .env there. Import it
 # optionally so the same module works in both places.
@@ -86,14 +88,21 @@ mcp = MCPServer(
     token_verifier=_token_verifier,
     auth=_auth_settings(_token_verifier),
 )
-# Read side: get_brief/get_value are deterministic lookups returning whole
-# documents; search_context ranks and truncates, so it's for history only.
+# Read side, cheapest first — which is also the order they should be reached
+# for. get_index is a map with no contents and is what a session should open
+# with; get_brief/get_value are deterministic lookups returning whole documents;
+# search_context ranks and truncates, so it's for history only.
+mcp.add_tool(get_index, description=GET_INDEX_DESCRIPTION)
 mcp.add_tool(get_brief, description=GET_BRIEF_DESCRIPTION)
 mcp.add_tool(get_value, description=GET_VALUE_DESCRIPTION)
 mcp.add_tool(search_context, description=SEARCH_CONTEXT_DESCRIPTION)
-# add_update appends history; change_update replaces current state. The split
-# replaces the old save_update, whose name said nothing about which it did.
+# Write side, in the order they should be reached for: add_update appends
+# history, patch_context edits current state in place, change_update rewrites a
+# slot wholesale. patch_context is registered before change_update deliberately
+# — it is the default write, and change_update is now the exception, kept for
+# creating a slot or replacing one outright.
 mcp.add_tool(add_update, description=ADD_UPDATE_DESCRIPTION)
+mcp.add_tool(patch_context, description=PATCH_CONTEXT_DESCRIPTION)
 mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
 
 # /map and /map/data are NOT registered. Custom routes bypass MCP-level auth by

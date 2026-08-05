@@ -1,35 +1,37 @@
 """
 Write tool: change_update. Replaces one summary slot — the "whiteboard" half.
 
+NO LONGER THE DEFAULT WRITE. patch_context edits a passage in place and is the
+right tool for almost every change; this one exists for the wholesale rewrite,
+where the new document genuinely bears no resemblance to the old. Preferring it
+by habit means regenerating a thousand-token summary to move one line.
+
 One living document per project+category, at a deterministic id. Updating the
 tech stack physically cannot touch the architecture slot: different id,
-different row. That granularity is the whole point — a change to one thing
-never requires resending the rest of a project's brief.
+different row.
 
-Replacing is destructive in a way appending isn't, so three safeguards apply
-(see ContextStore.update_summary): the previous content comes back in the
-response, an implausibly short replacement is refused outright, and whatever
-was there is archived as a chunk before being overwritten.
+Replacing is destructive in a way appending or patching isn't, so three
+safeguards apply (see ContextStore.update_summary): the previous content comes
+back in the response, an implausibly short replacement is refused outright, and
+whatever was there is archived as a chunk before being overwritten.
 """
 from __future__ import annotations
 from typing import Annotated, Optional
 
 from pydantic import Field
 
-from shared.store import SummaryShrinkRefused
+from shared.store import SummaryShrinkRefused, UnknownSummaryKey
 
 from mcp_server.context import get_store
 from mcp_server.review_log import log_write
 
-DESCRIPTION = """Update the CURRENT STATE of one thing about a project, replacing whatever was recorded before. Use this when a fact that already has a value has changed — the tech stack, the architecture, the config, a standing preference.
+DESCRIPTION = """Replace a category's summary WHOLESALE — creating it for the first time, or rewriting it from scratch when the new version bears no resemblance to the old.
 
-Each project+category is ONE living document. Writing to tech_stack replaces only tech_stack; architecture, config and everything else are untouched. So when something in a brief changes, update just that category — never resend the whole brief.
+Use patch_context INSTEAD for ordinary changes to something that already has a value. This tool REPLACES the entire category and does not merge, so `content` must be the COMPLETE new state; sending only the changed part destroys the rest, and regenerating a long summary to alter a line or two is exactly the waste patch_context exists to avoid. A replacement much shorter than what's stored is refused.
 
-CRITICAL: this REPLACES the entire contents of that category, it does not merge. `content` must be the COMPLETE new state, not just the part that changed. Read the current value first (search_context, or the brief you were given) and send it back in full with your change folded in. Sending only the changed fragment destroys everything else in that category — a replacement much shorter than what's stored is refused for exactly this reason.
+Use add_update INSTEAD for point-in-time facts that should accumulate — a decision made, an event, something discovered. Those belong in history, not in a slot that gets overwritten.
 
-Use add_update INSTEAD for point-in-time facts that should accumulate — a decision that was made, an event, something discovered. Those belong in the history, not in a slot that gets overwritten.
-
-The previous content is returned so you can confirm nothing was lost, and it's archived automatically, so a bad overwrite is recoverable rather than fatal."""
+The previous content is returned and archived automatically, so a bad overwrite is recoverable."""
 
 
 def change_update(
@@ -55,6 +57,23 @@ def change_update(
             description='"client" or "personal". Required if project is set, omitted otherwise.'
         ),
     ] = None,
+    key: Annotated[
+        Optional[str],
+        Field(
+            description="Sub-topic within the category, e.g. 'cognito' or 'deploy' under config. "
+            "Omit for the category's main slot. Use get_index to see which keys already exist — "
+            "reuse an existing one rather than coining a synonym, or the category fragments."
+        ),
+    ] = None,
+    create_key: Annotated[
+        bool,
+        Field(
+            description="Required to open a NEW key in a category that already has slots. Without "
+            "it the write is refused and the existing keys come back, closest first — because a "
+            "near-duplicate key ('compute' beside 'lambda') splits a topic in two and nothing "
+            "later notices. Set true only after checking that none of them already means this."
+        ),
+    ] = False,
     allow_shrink: Annotated[
         bool,
         Field(
@@ -73,7 +92,23 @@ def change_update(
             tier=tier,
             source="live",
             allow_shrink=allow_shrink,
+            key=key,
+            create_key=create_key,
         )
+    except UnknownSummaryKey as refusal:
+        # Returned, not raised, for the same reason as the shrink refusal: the
+        # caller can only avoid fragmenting the category if it can see what is
+        # already in it. Ranked closest-first by content, as a suggestion — the
+        # choice is the caller's, because no similarity cutoff separates
+        # synonyms from unrelated keys reliably enough to make it automatically.
+        return {
+            "changed": False,
+            "refused": "unknown_key",
+            "reason": str(refusal),
+            "existing_keys": [k if k else "(unkeyed)" for k in refusal.existing],
+            "hint": "Reuse whichever of these already means the same thing, or resend "
+                    "with create_key=true if this really is a new topic.",
+        }
     except SummaryShrinkRefused as refusal:
         # Returned rather than raised: the model needs the current text in order
         # to merge properly, and an exception string alone doesn't give it that.

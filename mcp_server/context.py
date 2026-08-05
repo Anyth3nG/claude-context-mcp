@@ -27,8 +27,18 @@ def get_store() -> ContextStore:
         # (e.g. proving the tool wiring works before a Voyage key is configured).
         # Defaults to False so production behavior still matches docs/schema.md:
         # Voyage is required unless someone deliberately opts out.
+        #
+        # CONTEXT_MCP_FORCE_LOCAL is the tool-layer equivalent of the use_cloud=False
+        # that ContextStore's own smoke tests pass, and it exists because clearing
+        # the CHROMA_* variables is NOT enough to stay off the real store: server.py
+        # calls load_dotenv() at import, so anything unset in the environment is
+        # immediately repopulated from .env. Exercising the tools against a
+        # developer's populated .env therefore writes fixture entries straight into
+        # the shared Cloud store — which is exactly what happened once. Set this to
+        # 1 in any test that drives the tools.
         _store = ContextStore(
             persist_path=os.environ.get("CHROMA_PATH", DEFAULT_CHROMA_PATH),
             allow_local_fallback=os.environ.get("ALLOW_LOCAL_FALLBACK") == "1",
+            use_cloud=False if os.environ.get("CONTEXT_MCP_FORCE_LOCAL") == "1" else None,
         )
     return _store

@@ -88,8 +88,104 @@ so lists fail on reads against Cloud while working fine locally.
   summary for the same project+category REPLACES the old one — there is only
   ever one living summary per slot. Enforced in `ContextStore.save()`, not
   left to callers to get right.
-- **Chunks always insert** with a unique generated id — never overwritten,
-  accumulate over time as a raw fallback layer.
+- **Chunks insert** under a **content-addressed** id:
+  `sha1(f"{project}-{category}-{document}")`. Same text in the same
+  project+category is the same entry, always. This id previously mixed in
+  `datetime.now().timestamp()`, which made every write unique and therefore made
+  a re-run after a partial failure DUPLICATE everything already written instead
+  of resuming — fatal for a bulk backfill, where partial failure is the expected
+  case. The trade-off is accepted deliberately: byte-identical text written twice
+  now collapses to one entry. A chunk carries no position or ordering, so a
+  duplicate holds no information the first copy didn't, and its only effect on
+  retrieval is to occupy a second slot in `top_k`.
+
+### Sub-keys: one slot per topic, not per category
+
+A summary slot may carry an optional `key`, making its id
+`f"{project}-{category}-{key}-summary"`. **Omitting the key reproduces the
+original id byte for byte**, which is what makes this additive: slots written
+before keys existed keep working untouched, and a bloated category is split when
+someone next has reason to touch it rather than in a migration.
+
+The motivation is retrieval, not write cost — `patch_summary` already solved the
+write side. Search truncates at 800 characters, so before splitting, the five
+context-mcp summaries were 14-30% reachable; a query for a fact genuinely stored
+in `config` ranked that summary first and still returned an opening that did not
+contain the answer. After splitting into 31 keyed slots, mean reachability is
+98% and the same query returns three untruncated hits that all contain it.
+
+**Key collisions are the caller's decision, never the server's.** Creating a new
+key in a category that already has slots requires `create_key=True`; without it
+the write is refused and the category's existing keys come back, ranked closest
+first. That design is forced by measurement:
+
+| Approach | Result |
+|---|---|
+| difflib on key names | `lambda`/`compute` 0.15, `cognito`/`auth` 0.18 — blind to synonyms. Worse, `config-lambda`/`config-lambda-settings` scores 0.74 against a 0.75 cutoff: the real fragmentation case, missed by 0.01. |
+| Voyage on key names | Classes **overlap**. Lowest same-concept pair 0.538 (`chroma`/`storage`); highest unrelated pair 0.635 (`networking`/`credentials`). No cutoff separates them. |
+| Voyage on slot **content** | Right slot ranked top in most cases, near the top in all — good enough to *suggest*, not to *decide*. |
+
+So embeddings rank the candidates (`summary_keys_ranked`, one query on the
+refusal path only) and the caller chooses. A duplicate key can be merged later;
+content silently merged into the wrong key cannot be unmerged.
+
+`summary_keys()` lists a category's keys with the unkeyed slot included as
+`None` — during a split it is the thing a new key is most likely to duplicate,
+and leaving it out is how a category ends up with both `config` and
+`config-lambda` disagreeing about the same subject.
+
+Keys are slugified (lowercase, hyphenated, alphanumeric, ≤40 chars); `summary`
+is reserved because it would collide with the unkeyed id. Slugification handles
+only meaningless differences — case, spacing, punctuation. Whether `lambda` and
+`compute` are the same topic is not a string problem and is not treated as one.
+
+**Cost note:** the index grows with splitting — 114 tokens at 5 slots, 514 at
+32. Still far below a brief (~4,270), but it scales linearly, so an unscoped
+index across many split projects will eventually need a rollup rather than a
+line per slot.
+
+### Changing a summary: patch, don't rewrite
+
+`patch_summary()` is the DEFAULT way to change a stored summary;
+`update_summary()` is for creating a slot or rewriting one wholesale.
+
+The reason is write cost, and it is asymmetric in a way that isn't obvious.
+Replacement requires the caller to reproduce the entire new document — so
+altering one line of a 1,000-token summary means *generating* 1,000 tokens, the
+expensive and slow kind, to move a few characters. A patch sends only the diff.
+Measured against this store's own summaries at the time of the change:
+`context-mcp/config` was 966 tokens and `context-mcp/goal` 1,363, so every
+correction to either paid four figures of output tokens regardless of size.
+
+Patching is also the safer operation, which is why its guardrails are lighter:
+
+| | `update_summary` | `patch_summary` |
+|---|---|---|
+| Blast radius | the whole slot | bounded by `len(old_str)` |
+| Shrink guard | yes (`SHRINK_GUARD_RATIO`) | not needed — it can only rewrite what it matched |
+| Archives previous | always | conditionally (below) |
+
+Three refusals, each returning the stored document so the caller can retry
+against reality rather than its own stale copy — the same contract as
+`SummaryShrinkRefused`: **no match**, **more than one match** (extend `old_str`
+until it is unique; patching the wrong occurrence is silent and near-impossible
+to spot later), and **a patch that would change nothing**. `tier` is inherited
+from the slot rather than accepted as an argument, since a patch edits something
+that already exists and re-declaring its tier could only introduce disagreement.
+
+Archiving is conditional on two independent triggers, tracked by an
+`unarchived_patches` counter in the summary's own metadata:
+
+- `PATCH_ARCHIVE_RATIO` (0.2) — a patch touching this fraction of the document
+  is approaching a rewrite, so it gets archived like one.
+- `PATCH_ARCHIVE_EVERY` (5) — the per-patch reasoning holds individually but not
+  in aggregate: twenty surgical edits, each far under the ratio, can still
+  rewrite a document between checkpoints. A forced copy every N patches bounds
+  that drift.
+
+Both are cheap because `_archive()` reuses the embedding Chroma already holds —
+the text is unchanged, so its vector is still exactly right and a checkpoint
+costs no Voyage call.
 
 ## Category enforcement
 
@@ -105,6 +201,41 @@ malicious or ambiguous), but a silent correction would just relocate the
 original problem — an entry filed under a category the caller didn't
 realize was substituted.
 
+## Reading: index first, then narrow
+
+Three read instruments, cheapest first. The order they're listed in is the order
+they should be reached for:
+
+| Tool | Cost against this store | Answers |
+|---|---|---|
+| `get_index` | ~114 tokens | what exists, how big, how stale |
+| `get_value` | one category | what does X currently say |
+| `get_brief` | ~4,280 tokens (one project) | everything, whole |
+| `search_context` | ranked, truncated | history and reasoning |
+
+`ContextStore.index()` returns the map without any of the contents: one line per
+summary slot with its size and last-write date, plus a count of history chunks.
+It makes **no Voyage call** — both underlying reads are metadata lookups rather
+than similarity queries — and it stays small as the store grows, because there
+is only ever one living summary per project+category no matter how much history
+accumulates beneath it.
+
+The size figures are the point of it: they let a caller see what a `get_brief`
+or `get_value` would cost *before* paying it, so "is there anything relevant
+here" stops being a question that costs thousands of tokens to ask. Superseded
+archives are excluded from the counts — they are recoverable history, not part
+of what the store currently knows, and including them would make every edited
+slot look like it had grown.
+
+Documents are fetched (not just metadata) to measure their length, but the text
+never leaves `index()`. That is affordable precisely because summaries are one
+per slot; it would not be if the index covered chunks, which is one reason it
+counts them rather than measuring them.
+
+**This does not make a session look.** Nothing here prompts a lookup — the index
+only makes looking cheap once something decides to. Getting a session to check
+unprompted is a client-instruction problem, not a tool one.
+
 ## Retrieval budget
 
 `search_context` defaults to `top_k=5`, hard-capped at 10, and truncates each
@@ -113,6 +244,28 @@ Prevents one call from dumping unbounded tokens into the conversation. If a
 query genuinely needs full content beyond that, the summary itself should be
 the thing that's short — this is a signal to fix the summary, not a reason to
 raise the cap by default.
+
+### Split at write time, not read time
+
+The cap is a display-time cut, so an entry longer than it is a *partly
+invisible* entry: no phrasing of any query reaches past the first 800
+characters. When this was measured, **21 of 23 stored chunks exceeded the cap**
+(median 2,584 characters), meaning `search_context` was returning a partial
+document roughly 91% of the time. The fix belongs at write time, where the
+material can still be divided along its own seams — only the writer knows where
+those are.
+
+Two things make that practical rather than merely advisable:
+
+- `save_chunks()` writes a whole list in ONE upsert, and therefore one embedding
+  call. Voyage bills and rate-limits per *request*, not per document, and Chroma
+  issues one embed call per upsert regardless of how many documents it carries —
+  so five focused chunks cost the same as one sprawling one. Without this,
+  splitting would trade a retrieval problem for five times the write latency and
+  nobody would do it.
+- Writes that still exceed the cap come back flagged (`oversized`), at the
+  moment splitting is free, rather than being discovered later as a silently
+  truncated search result.
 
 ## Example entries
 
