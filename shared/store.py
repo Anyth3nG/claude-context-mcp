@@ -46,6 +46,18 @@ CATEGORY_MATCH_CUTOFF = 0.75
 # returning last month's answer alongside this month's.
 SUPERSEDED_SOURCE = "superseded"
 
+# Marks a chunk that turned out to be WRONG, as opposed to merely old. Kept
+# separate from SUPERSEDED_SOURCE on purpose: a superseded summary is an earlier
+# version that was true when written, so include_superseded=True is a reasonable
+# way to ask "what did this used to say?". A retired chunk is a fact later shown
+# to be incorrect, and pulling it back under that same flag would hand a caller
+# known-wrong material while it believes it asked for history. Both are hidden
+# from search by default; only retirement carries a reason.
+RETIRED_SOURCE = "retired"
+
+# Sources hidden from search unless a caller opts back in.
+HIDDEN_SOURCES = (SUPERSEDED_SOURCE, RETIRED_SOURCE)
+
 # A replacement shorter than this fraction of the current summary is refused.
 # Catches the characteristic failure of overwrite-in-place: a caller that read a
 # four-line summary, noticed one fact changed, and sends back only that fact —
@@ -134,6 +146,17 @@ class PatchFailed(Exception):
         self.summary_id = summary_id
         self.current = current
         super().__init__(message)
+
+
+class ChunkNotFound(Exception):
+    """No entry at that id. Ids come back from search_context alongside each hit."""
+
+    def __init__(self, chunk_id: str):
+        self.chunk_id = chunk_id
+        super().__init__(
+            f"No entry with id '{chunk_id}'. Chunk ids are returned by search_context "
+            "with each result — copy one from there rather than constructing it."
+        )
 
 
 class PatchSlotMissing(PatchFailed):
@@ -750,6 +773,79 @@ class ContextStore:
         self.collection.upsert(**archive_kwargs)
         return archived_id
 
+    def retire_chunk(
+        self,
+        chunk_id: str,
+        reason: str,
+        superseded_by: Optional[str] = None,
+    ) -> dict:
+        """
+        Mark a chunk as WRONG so it stops competing with current entries.
+
+        Chunks are append-only: a fact recorded in good faith and later disproved
+        stays semantically searchable forever, ranking on the same queries as the
+        entry that corrected it. Nothing in the document says it was contradicted,
+        so a reader has no way to tell which of two plausible answers still holds.
+
+        This is metadata-only — collection.update() leaves the document and its
+        existing vector untouched, so retiring costs no Voyage call. The text is
+        kept rather than deleted: the record that something was believed, and when
+        it stopped being true, is worth more than the space it occupies.
+
+        Refuses to retire a summary. A summary's current value is replaced through
+        change_update or patch_context, which archives the old text properly;
+        flagging a live slot as wrong would leave the project with no value at all
+        for that category and nothing pointing at what replaced it.
+        """
+        if not reason or not reason.strip():
+            raise ValueError("reason is required — a retired chunk with no stated reason is worse than none")
+
+        got = self.collection.get(ids=[chunk_id], include=["documents", "metadatas"])
+        if not got["ids"]:
+            raise ChunkNotFound(chunk_id)
+
+        meta = dict(got["metadatas"][0])
+        document = got["documents"][0]
+        if meta.get("type") != "chunk":
+            raise ValueError(
+                f"'{chunk_id}' is a {meta.get('type')}, not a chunk. Replace a summary's "
+                "value with change_update or patch_context instead — that archives the "
+                "old text and leaves a current value in place."
+            )
+        if meta.get("source") == RETIRED_SOURCE:
+            return {
+                "retired": False,
+                "already_retired": True,
+                "id": chunk_id,
+                "reason": meta.get("retired_reason"),
+                "retired_at": meta.get("retired_at"),
+            }
+
+        previous_source = meta.get("source")
+        meta.update(
+            {
+                "source": RETIRED_SOURCE,
+                "retired_reason": reason.strip(),
+                "retired_at": datetime.now(timezone.utc).isoformat(),
+                "retired_from_source": previous_source,
+            }
+        )
+        if superseded_by:
+            meta["superseded_by"] = superseded_by
+        # update(), not upsert(): the document and its embedding stay exactly as
+        # they are, so this is a metadata write and nothing is re-embedded.
+        self.collection.update(ids=[chunk_id], metadatas=[meta])
+        return {
+            "retired": True,
+            "id": chunk_id,
+            "reason": reason.strip(),
+            "superseded_by": superseded_by,
+            "previous_source": previous_source,
+            "project": meta.get("project"),
+            "category": meta.get("category"),
+            "excerpt": document[:200],
+        }
+
     def patch_summary(
         self,
         old_str: str,
@@ -862,12 +958,13 @@ class ContextStore:
         small by construction, since there is only ever one living summary per
         project+category no matter how much history accumulates underneath it.
 
-        Superseded archives are excluded. They are recoverable history, not part
-        of what the store currently knows, and counting them here would make
-        every edited slot look like it had grown.
+        Superseded archives and retired chunks are both excluded. Neither is part
+        of what the store currently knows: counting archives would make every
+        edited slot look like it had grown, and counting retired chunks would
+        report material the store has been told is wrong.
         """
         summary_where: dict = {"type": "summary"}
-        chunk_clauses: list[dict] = [{"type": "chunk"}, {"source": {"$ne": SUPERSEDED_SOURCE}}]
+        chunk_clauses: list[dict] = [{"type": "chunk"}, {"source": {"$nin": list(HIDDEN_SOURCES)}}]
         if project:
             summary_where = {"$and": [summary_where, {"project": project}]}
             chunk_clauses.append({"project": project})
@@ -1012,6 +1109,7 @@ class ContextStore:
         category: Optional[str] = None,
         top_k: int = DEFAULT_TOP_K,
         include_superseded: bool = False,
+        include_retired: bool = False,
     ):
         corrected_from = None
         if category is not None:
@@ -1023,11 +1121,21 @@ class ContextStore:
             where_clauses.append({"project": project})
         if category:
             where_clauses.append({"category": category})
+        # Two separate exclusions, deliberately not one flag. Without the first,
+        # archived summaries compete with live ones and stale facts resurface as
+        # if current; history stays retrievable, but only when asked for. The
+        # second hides chunks retired as WRONG — and asking for old versions of a
+        # summary must not drag those back in, which is exactly what would happen
+        # if retirement reused the superseded flag.
+        hidden = []
         if not include_superseded:
-            # Without this, archived summaries compete with live ones and stale
-            # facts resurface as if current. History stays retrievable, but only
-            # when a caller explicitly asks for it.
-            where_clauses.append({"source": {"$ne": SUPERSEDED_SOURCE}})
+            hidden.append(SUPERSEDED_SOURCE)
+        if not include_retired:
+            hidden.append(RETIRED_SOURCE)
+        if len(hidden) == 1:
+            where_clauses.append({"source": {"$ne": hidden[0]}})
+        elif hidden:
+            where_clauses.append({"source": {"$nin": hidden}})
 
         where = None
         if len(where_clauses) == 1:
@@ -1458,6 +1566,59 @@ if __name__ == "__main__":
     keyed_index = store.index(project="keytest")["projects"]["keytest"]["summaries"]
     print(f"  index labels: {sorted(keyed_index)}")
     assert "config" in keyed_index and "config/cognito" in keyed_index
+
+    print("\n=== retire_chunk: a disproved fact stops competing with the one that fixed it ===")
+    saved = store.save_chunks(
+        [
+            "Rotation is easy: update the secret and the next cold start picks it up.",
+            "The OIDC subject claim was the CI failure.",
+        ],
+        category="config", project="retiretest", tier="personal",
+    )
+    wrong, other = saved["ids"][0], saved["ids"][1]
+
+    def _visible(**kw):
+        return set(store.search(query="rotating a secret", project="retiretest", top_k=10, **kw)["ids"][0])
+
+    assert wrong in _visible(), "chunk should be searchable before retirement"
+    res = store.retire_chunk(
+        wrong,
+        reason="SnapStart means a cold start does NOT pick up a rotated secret.",
+        superseded_by="config/rotation",
+    )
+    assert res["retired"] and res["previous_source"] == "live"
+    assert wrong not in _visible(), "retired chunk must drop out of default search"
+    assert other in _visible(), "retiring one chunk must not affect its neighbours"
+    print("  hidden from search, neighbour untouched.")
+
+    # The whole reason retirement has its own source value: asking for old
+    # versions of a summary must not hand back facts known to be wrong.
+    assert wrong not in _visible(include_superseded=True), \
+        "include_superseded must NOT resurface retired chunks — that is why RETIRED_SOURCE is separate"
+    assert wrong in _visible(include_retired=True), "include_retired should surface it for auditing"
+    print("  include_superseded does not resurface it; include_retired does.")
+
+    meta = store.collection.get(ids=[wrong], include=["metadatas"])["metadatas"][0]
+    assert meta["source"] == RETIRED_SOURCE and meta["superseded_by"] == "config/rotation"
+    assert meta["retired_reason"].startswith("SnapStart")
+    assert store.retire_chunk(wrong, reason="again")["already_retired"] is True
+    assert store.index(project="retiretest")["projects"]["retiretest"]["history_chunks"] == 1, \
+        "retired chunks must not be counted as live history"
+    print("  metadata recorded, idempotent, excluded from the index count.")
+
+    store.update_summary("A live summary.", category="config", project="retiretest", tier="personal")
+    for bad_id, label in [(store.summary_id("retiretest", "config"), "a summary"), ("chunk-nope", "a missing id")]:
+        try:
+            store.retire_chunk(bad_id, reason="x")
+            raise AssertionError(f"retiring {label} should have been refused")
+        except (ValueError, ChunkNotFound):
+            pass
+    try:
+        store.retire_chunk(other, reason="   ")
+        raise AssertionError("a blank reason should have been refused")
+    except ValueError:
+        pass
+    print("  refuses summaries, unknown ids, and blank reasons.")
 
     shutil.rmtree(TEST_PATH, ignore_errors=True)
     shutil.rmtree(FALLBACK_PATH, ignore_errors=True)
