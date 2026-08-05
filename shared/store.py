@@ -707,7 +707,9 @@ class ContextStore:
             emb[0] if with_embedding and emb is not None and len(emb) else None,
         )
 
-    def get_brief(self, project: Optional[str] = None) -> list[dict]:
+    def get_brief(
+        self, project: Optional[str] = None, category: Optional[str] = None
+    ) -> list[dict]:
         """
         Every living summary for a project, returned WHOLE — no similarity
         ranking, no top_k, no truncation.
@@ -717,10 +719,22 @@ class ContextStore:
         five best-matching documents, which for long entries means most of the
         content is unreachable no matter how the query is phrased. A brief is a
         deterministic id lookup, so it can hand back the complete text.
+
+        Passing `category` narrows it to one category. That matters once a
+        project has real depth: context-mcp's full brief is ~17k characters, but
+        a session working on auth wants architecture + config + decisions about
+        Cognito, not the retrieval roadmap. Loading the whole thing to read a
+        fifth of it is the same waste get_brief was built to avoid at the
+        search layer, one level up.
         """
         project_key = project or "general"
+        clauses: list[dict] = [{"project": project_key}, {"type": "summary"}]
+        corrected_from = None
+        if category is not None:
+            category, corrected_from = _normalize_category(category)
+            clauses.append({"category": category})
         got = self.collection.get(
-            where={"$and": [{"project": project_key}, {"type": "summary"}]},
+            where={"$and": clauses},
             include=["documents", "metadatas"],
         )
         entries = [
@@ -737,7 +751,71 @@ class ContextStore:
         # Stable, readable order rather than whatever the store returns. Slots
         # of one category group together, the unkeyed one leading.
         entries.sort(key=lambda e: (e["category"] or "", e["key"] or ""))
+        if corrected_from:
+            for e in entries:
+                e["category_corrected_from"] = corrected_from
         return entries
+
+    def slot_history(
+        self,
+        project: Optional[str],
+        category: str,
+        key: Optional[str] = None,
+    ) -> dict:
+        """
+        Every archived version of ONE slot, newest first.
+
+        History was only ever reachable through search(), which means guessing
+        at words: a caller who knows exactly which slot it cares about still had
+        to phrase a query and hope ranking cooperated. But every archive already
+        records superseded_from (the slot it came from) and superseded_at (when
+        it stopped being current), so the version chain existed all along with
+        nothing able to read it.
+
+        A metadata lookup, so no embedding call and no ranking — ask for a slot's
+        past and get exactly that slot's past, complete and in order.
+
+        Deliberately slot-scoped. "How did this entry evolve" and "what happened
+        around the 3rd" are different questions on the same metadata; the second
+        is easy to add later against superseded_at, and is not built until
+        something actually needs it.
+        """
+        category, corrected_from = _normalize_category(category)
+        key = _normalize_key(key)
+        sid = self.summary_id(project, category, key)
+        got = self.collection.get(
+            where={"superseded_from": sid}, include=["documents", "metadatas"]
+        )
+        versions = [
+            {
+                "archived_id": vid,
+                "content": doc,
+                "superseded_at": meta.get("superseded_at"),
+                "written_at": meta.get("timestamp"),
+                "chars": len(doc),
+                "reason": meta.get("archived_reason") or meta.get("superseded_reason"),
+            }
+            for vid, doc, meta in zip(got["ids"], got["documents"], got["metadatas"])
+        ]
+        # Newest first: the most recent previous value is nearly always the one
+        # being asked for, and reverse-chronological reads as a changelog.
+        versions.sort(key=lambda v: v["superseded_at"] or "", reverse=True)
+
+        current = self.get_summary(project, category, key=key)
+        return {
+            "slot": category + (f"/{key}" if key else ""),
+            "project": project or "general",
+            "summary_id": sid,
+            "current": (
+                {"content": current[0], "chars": len(current[0]),
+                 "timestamp": current[1].get("timestamp")}
+                if current else None
+            ),
+            "archived_slot": current is None and bool(versions),
+            "versions": versions,
+            "version_count": len(versions),
+            "category_corrected_from": corrected_from,
+        }
 
     def _archive(self, sid: str, previous_doc: str, previous_meta: dict, previous_emb) -> str:
         """
@@ -1031,6 +1109,20 @@ class ContextStore:
         chunks = self.collection.get(
             where={"$and": chunk_clauses}, include=["metadatas"]
         )
+        # Archived copies, counted per slot they came from. The index is what a
+        # session reads to decide where to look next, so it has to advertise
+        # what the next level down actually holds — a slot rewritten five times
+        # is worth knowing about, and without this the version chain is
+        # invisible unless someone already suspects it exists.
+        archived_where: dict = {"source": SUPERSEDED_SOURCE}
+        if project:
+            archived_where = {"$and": [archived_where, {"project": project}]}
+        archived = self.collection.get(where=archived_where, include=["metadatas"])
+        versions_per_slot: dict[str, int] = {}
+        for meta in archived["metadatas"]:
+            origin = meta.get("superseded_from")
+            if origin:
+                versions_per_slot[origin] = versions_per_slot.get(origin, 0) + 1
 
         projects: dict[str, dict] = {}
 
@@ -1038,6 +1130,20 @@ class ContextStore:
             return projects.setdefault(
                 name, {"summaries": {}, "brief_chars": 0, "history_chunks": 0}
             )
+
+        # Slots archived outright have no live summary to hang a version count
+        # on, so they would vanish from the map entirely. Counting them tells a
+        # session that retired work exists here without listing what it was.
+        live_ids = {
+            self.summary_id(m.get("project"), m.get("category"), m.get("key"))
+            for m in summaries["metadatas"]
+        }
+        archived_only: dict[str, int] = {}
+        for meta in archived["metadatas"]:
+            origin = meta.get("superseded_from")
+            if origin and origin not in live_ids:
+                proj = meta.get("project") or "general"
+                archived_only[proj] = archived_only.get(proj, 0) + 1
 
         for doc, meta in zip(summaries["documents"], summaries["metadatas"]):
             entry = slot(meta.get("project") or "general")
@@ -1047,10 +1153,18 @@ class ContextStore:
             label = meta.get("category")
             if meta.get("key"):
                 label = f"{label}/{meta['key']}"
-            entry["summaries"][label] = {
+            slot_info = {
                 "chars": len(doc),
                 "updated": (meta.get("timestamp") or "")[:10],
             }
+            prior = versions_per_slot.get(
+                self.summary_id(meta.get("project"), meta.get("category"), meta.get("key"))
+            )
+            if prior:
+                # Only present when there IS history, so the common case stays
+                # as terse as it was and a version count means something.
+                slot_info["prior_versions"] = prior
+            entry["summaries"][label] = slot_info
             entry["brief_chars"] += len(doc)
             if meta.get("tier"):
                 entry["tier"] = meta["tier"]
@@ -1061,8 +1175,10 @@ class ContextStore:
             if meta.get("tier"):
                 entry.setdefault("tier", meta["tier"])
 
-        for entry in projects.values():
+        for name, entry in projects.items():
             entry["summaries"] = dict(sorted(entry["summaries"].items()))
+            if archived_only.get(name):
+                entry["archived_slots"] = archived_only[name]
 
         return {
             "projects": dict(sorted(projects.items())),
@@ -1619,6 +1735,47 @@ if __name__ == "__main__":
     keyed_index = store.index(project="keytest")["projects"]["keytest"]["summaries"]
     print(f"  index labels: {sorted(keyed_index)}")
     assert "config" in keyed_index and "config/cognito" in keyed_index
+
+    print("\n=== get_brief(category=...): load one category, not the project ===")
+    store.update_summary("Python 3.13, FastAPI, Chroma.", category="tech_stack",
+                         project="tiers", tier="personal")
+    store.update_summary("OAuth only, no shared credential.", category="architecture",
+                         project="tiers", tier="personal")
+    store.update_summary("Alarm at 5 per 300s.", category="config",
+                         project="tiers", tier="personal")
+    whole = store.get_brief("tiers")
+    one = store.get_brief("tiers", category="architecture")
+    assert len(whole) == 3 and len(one) == 1 and one[0]["category"] == "architecture"
+    whole_chars = sum(len(e["content"]) for e in whole)
+    one_chars = sum(len(e["content"]) for e in one)
+    assert one_chars < whole_chars
+    print(f"  whole project {whole_chars} chars -> one category {one_chars} chars")
+    assert store.get_brief("tiers", category="architecure")[0]["category"] == "architecture", \
+        "a near-miss category should still resolve"
+    assert store.get_brief("tiers", category="goal") == [], "a category with no slots is empty, not an error"
+    print("  typo corrected, empty category returns cleanly.")
+
+    print("\n=== slot_history: a known slot's past, without guessing at words ===")
+    store.update_summary("Rotation is easy.", category="config", project="hist",
+                         tier="personal", key="rotation", create_key=False)
+    for text in ["Rotation needs a republish.", "Rotation needs a republish and an alias move."]:
+        store.update_summary(text, category="config", project="hist", tier="personal", key="rotation")
+    h = store.slot_history("hist", "config", "rotation")
+    assert h["version_count"] == 2, f"expected 2 archived versions, got {h['version_count']}"
+    assert h["current"]["content"].endswith("alias move.")
+    stamps = [v["superseded_at"] for v in h["versions"]]
+    assert stamps == sorted(stamps, reverse=True), "versions must come back newest first"
+    assert h["versions"][-1]["content"] == "Rotation is easy.", "oldest version should be the original"
+    assert h["archived_slot"] is False
+    print(f"  {h['version_count']} versions, newest first, current value alongside.")
+
+    idx_h = store.index(project="hist")["projects"]["hist"]["summaries"]["config/rotation"]
+    assert idx_h["prior_versions"] == 2, "the index must advertise that history exists"
+    print(f"  index advertises prior_versions={idx_h['prior_versions']} on the slot.")
+
+    empty = store.slot_history("hist", "tech_stack")
+    assert empty["version_count"] == 0 and empty["current"] is None
+    print("  a slot with no history returns cleanly rather than erroring.")
 
     print("\n=== archive_slot: finished work leaves the brief but stays retrievable ===")
     store.update_summary("PHASE X - do the thing. DONE, shipped as abc1234.",
