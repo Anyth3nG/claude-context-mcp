@@ -178,6 +178,56 @@ def _transport_security() -> TransportSecuritySettings:
     return TransportSecuritySettings(allowed_hosts=[h.strip() for h in allowed.split(",")])
 
 
+class RejectStreamGet:
+    """
+    Answers GET /mcp with 405 instead of letting it hang to the Lambda timeout.
+
+    Streamable HTTP has an OPTIONAL server-to-client SSE stream, opened with a
+    GET to the same endpoint. Clients try it on connect. This server runs
+    stateless behind API Gateway, where a long-lived stream cannot work — so
+    nothing ever answers, and the request sits there until Lambda kills it. One
+    per client connection: cheap, but it burns the full timeout every time and
+    makes real hangs impossible to spot in the logs.
+
+    405 is the spec's own answer for a server that does not offer the stream, so
+    clients treat it as "fine, POST only" and move on immediately.
+
+    Runs BEFORE auth on purpose. The method is wrong regardless of who is
+    asking, and a 405 discloses nothing — it says only that this endpoint speaks
+    POST, which its own protocol documentation already says. Answering 401 first
+    would mean an authenticated client still had to discover the hang.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("method") == "GET":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 405,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        # Spec-correct on a 405, and tells a client what to do
+                        # next without it having to guess.
+                        (b"allow", b"POST"),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"error":"method_not_allowed",'
+                    b'"detail":"This endpoint is POST-only. The optional GET SSE '
+                    b'stream is not supported: the server runs stateless behind '
+                    b'API Gateway, where a long-lived stream cannot be held."}',
+                }
+            )
+            return
+        await self.app(scope, receive, send)
+
+
 class UnauthenticatedRejectionLogger:
     """
     Logs the one rejection class the token verifier never sees.
@@ -254,7 +304,12 @@ def build_asgi_app():
         json_response=True,
         transport_security=_transport_security(),
     )
-    return UnauthenticatedRejectionLogger(app)
+    # Order matters. RejectStreamGet is outermost so a GET is answered before
+    # anything else runs: it never reaches auth, so it never produces a 401 for
+    # the rejection logger to count. That is correct — a wrong method is not a
+    # failed authentication, and counting it as one would pollute the alarm that
+    # exists to catch probes.
+    return RejectStreamGet(UnauthenticatedRejectionLogger(app))
 
 
 def handler(event, context):
