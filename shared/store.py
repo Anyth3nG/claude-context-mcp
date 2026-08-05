@@ -773,6 +773,59 @@ class ContextStore:
         self.collection.upsert(**archive_kwargs)
         return archived_id
 
+    def archive_slot(
+        self,
+        project: Optional[str],
+        category: str,
+        key: Optional[str] = None,
+        reason: str = "",
+    ) -> dict:
+        """
+        Retire a whole summary slot: archive its text, then remove the live
+        document so it stops loading with every brief.
+
+        For work that is FINISHED rather than wrong. A completed phase is not
+        current state — it is a record of what was done — but a summary slot has
+        no way to say "done", so it keeps costing tokens on every get_brief for a
+        question nobody is asking any more. change_update can't express this
+        either: it archives the old text but insists on leaving a new live value
+        behind, and there is no value that means "this slot no longer applies".
+
+        The archived copy is a superseded chunk, not a retired one, and that
+        distinction is the point. Retired means wrong. Superseded means it was
+        true when written and still is as history — which is exactly what a
+        finished phase is, and why include_superseded=True is the right way to
+        pull one back for comparison.
+
+        Reuses _archive(), so the existing vector is carried over and this costs
+        no Voyage call at all. The delete only removes the live pointer; the text
+        and its embedding survive in the archive.
+        """
+        sid = self.summary_id(project, category, key)
+        current = self.get_summary(project, category, with_embedding=True, key=key)
+        if current is None:
+            raise PatchSlotMissing(sid)
+        doc, meta, emb = current
+
+        archive_meta = dict(meta)
+        if reason and reason.strip():
+            archive_meta["archived_reason"] = reason.strip()
+        archived_id = self._archive(sid, doc, archive_meta, emb)
+        # Only now drop the live document. If _archive raised, the slot is still
+        # intact — losing the copy and the original in one call is the failure
+        # this ordering exists to prevent.
+        self.collection.delete(ids=[sid])
+        return {
+            "archived": True,
+            "id": sid,
+            "archived_id": archived_id,
+            "chars_freed": len(doc),
+            "reason": reason.strip() or None,
+            "project": project or "general",
+            "category": category,
+            "key": key,
+        }
+
     def retire_chunk(
         self,
         chunk_id: str,
@@ -1566,6 +1619,42 @@ if __name__ == "__main__":
     keyed_index = store.index(project="keytest")["projects"]["keytest"]["summaries"]
     print(f"  index labels: {sorted(keyed_index)}")
     assert "config" in keyed_index and "config/cognito" in keyed_index
+
+    print("\n=== archive_slot: finished work leaves the brief but stays retrievable ===")
+    store.update_summary("PHASE X - do the thing. DONE, shipped as abc1234.",
+                         category="goal", project="archtest", tier="personal", key="phase-x")
+    store.update_summary("PHASE Y - still outstanding.",
+                         category="goal", project="archtest", tier="personal", key="phase-y",
+                         create_key=True)
+    before = store.index(project="archtest")["projects"]["archtest"]
+    assert "goal/phase-x" in before["summaries"] and "goal/phase-y" in before["summaries"]
+    arch = store.archive_slot(project="archtest", category="goal", key="phase-x",
+                              reason="Completed 2026-08-05; detail is history, not current state.")
+    after = store.index(project="archtest")["projects"]["archtest"]
+    assert arch["archived"] and arch["chars_freed"] > 0
+    assert "goal/phase-x" not in after["summaries"], "archived slot must leave the index"
+    assert "goal/phase-y" in after["summaries"], "archiving one slot must not touch another"
+    assert after["brief_chars"] < before["brief_chars"]
+    assert not any(e["key"] == "phase-x" for e in store.get_brief("archtest")), \
+        "archived slot must leave get_brief — that is the whole point"
+    print(f"  gone from brief and index, freed {arch['chars_freed']} chars; sibling untouched.")
+
+    # Archived as SUPERSEDED, not RETIRED: it was true when written.
+    back = store.search(query="phase X do the thing", project="archtest",
+                        top_k=10, include_superseded=True)
+    assert arch["archived_id"] in back["ids"][0], "include_superseded must bring it back"
+    gone = store.search(query="phase X do the thing", project="archtest", top_k=10)
+    assert arch["archived_id"] not in gone["ids"][0], "default search must not surface it"
+    amet = store.collection.get(ids=[arch["archived_id"]], include=["metadatas"])["metadatas"][0]
+    assert amet["source"] == SUPERSEDED_SOURCE, "finished is superseded, not retired"
+    assert amet["archived_reason"].startswith("Completed")
+    print("  recoverable via include_superseded, flagged superseded not retired.")
+
+    try:
+        store.archive_slot(project="archtest", category="goal", key="never-existed")
+        raise AssertionError("archiving a missing slot should have been refused")
+    except PatchSlotMissing:
+        print("  refuses a slot that does not exist.")
 
     print("\n=== retire_chunk: a disproved fact stops competing with the one that fixed it ===")
     saved = store.save_chunks(
