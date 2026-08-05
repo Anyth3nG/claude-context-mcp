@@ -6,6 +6,11 @@ current state of X". Search ranks by similarity and truncates each hit to keep
 one call from flooding the conversation; that's correct for exploring history,
 but it means a long entry is only ever visible from the top. A brief is a
 deterministic lookup of the summary slots, so nothing is ranked away or cut.
+
+No longer the way to OPEN a session, though. Returning everything whole is the
+most expensive read here, and paying it before knowing whether the store holds
+anything relevant is the wrong default — get_index answers that for a fraction
+of the cost, and usually redirects to a single get_value.
 """
 from __future__ import annotations
 from typing import Annotated, Optional
@@ -16,7 +21,9 @@ from mcp_server.context import get_store
 
 DESCRIPTION = """Get the complete current-state brief for a project — its tech stack, architecture, configuration and standing decisions — as whole documents, not search results.
 
-Call this FIRST when you start working on a project you don't already have context for, or when the user asks what a project is, how it works, how it's set up, or where it stands. It is the cheapest way to get oriented: one call, no query to guess at, and the content comes back untruncated.
+This returns EVERYTHING for a project untruncated, so it is the most expensive read here (thousands of tokens for a well-populated project). Use it when you genuinely want the whole picture: the user asks what a project is, how it works, or where it stands, or you are about to do substantial work across it.
+
+Check get_index FIRST if you don't already know what's stored. It costs a fraction of this, shows which categories exist and how large each one is, and will often point you at get_value for the single category you actually needed.
 
 Prefer this over search_context whenever the question is about CURRENT STATE. search_context ranks by similarity and shortens each result, so a long entry is only ever partly visible; it is the right tool for history — "what did we decide about X", "why did we do Y", "when did Z change" — and the wrong one for "what is the stack".
 
