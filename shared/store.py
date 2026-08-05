@@ -1075,7 +1075,7 @@ class ContextStore:
             **metadata,
         }
 
-    def index(self, project: Optional[str] = None) -> dict:
+    def index(self, project: Optional[str] = None, detail: str = "slots") -> dict:
         """
         A map of what this store holds, without any of the contents.
 
@@ -1093,7 +1093,16 @@ class ContextStore:
         of what the store currently knows: counting archives would make every
         edited slot look like it had grown, and counting retired chunks would
         report material the store has been told is wrong.
+
+        detail="projects" drops the per-slot map and returns only the shape of
+        each project — the table of contents a session should OPEN with. At
+        eleven projects the full form is ~1,600 tokens and this is ~170, which is
+        the difference between a lookup a session will make by default and one it
+        has to be talked into. Everything below it is unchanged, so a caller that
+        wants slots asks for slots.
         """
+        if detail not in ("slots", "projects"):
+            raise ValueError(f"detail must be 'slots' or 'projects', got '{detail}'")
         summary_where: dict = {"type": "summary"}
         chunk_clauses: list[dict] = [{"type": "chunk"}, {"source": {"$nin": list(HIDDEN_SOURCES)}}]
         if project:
@@ -1191,6 +1200,30 @@ class ContextStore:
             entry["summaries"] = dict(sorted(entry["summaries"].items()))
             if archived_only.get(name):
                 entry["archived_slots"] = archived_only[name]
+
+        if detail == "projects":
+            # Counts and shape only. Enough to decide WHICH project to open and
+            # roughly what it will cost, which is the whole job of a contents
+            # page — anything more and it stops being cheap enough to open with.
+            toc = {}
+            for name, entry in sorted(projects.items()):
+                row = {
+                    "slots": len(entry["summaries"]),
+                    "brief_chars": entry["brief_chars"],
+                    "history_chunks": entry["history_chunks"],
+                }
+                if entry.get("tier"):
+                    row["tier"] = entry["tier"]
+                if entry.get("archived_slots"):
+                    row["archived_slots"] = entry["archived_slots"]
+                toc[name] = row
+            return {
+                "projects": toc,
+                "total_summaries": len(summaries["ids"]),
+                "total_history_chunks": len(chunks["ids"]),
+                "next": "get_brief(project) for one project's current state, "
+                        "or get_index(project=...) for its individual slots.",
+            }
 
         return {
             "projects": dict(sorted(projects.items())),
@@ -1747,6 +1780,26 @@ if __name__ == "__main__":
     keyed_index = store.index(project="keytest")["projects"]["keytest"]["summaries"]
     print(f"  index labels: {sorted(keyed_index)}")
     assert "config" in keyed_index and "config/cognito" in keyed_index
+
+    print("\n=== index(detail='projects'): the table of contents a session opens with ===")
+    import json as _json
+    full = store.index()
+    toc = store.index(detail="projects")
+    assert set(full["projects"]) == set(toc["projects"]), "the TOC must list every project"
+    for name, row in toc["projects"].items():
+        assert "summaries" not in row, "the TOC must not carry per-slot detail"
+        assert row["slots"] == len(full["projects"][name]["summaries"])
+        assert row["brief_chars"] == full["projects"][name]["brief_chars"]
+    full_size, toc_size = len(_json.dumps(full)), len(_json.dumps(toc))
+    assert toc_size < full_size
+    print(f"  {len(toc['projects'])} projects: {full_size} chars -> {toc_size} chars "
+          f"({100*toc_size/full_size:.0f}% of the full map)")
+    assert "next" in toc, "the TOC must say what to call next — that is the point"
+    try:
+        store.index(detail="nonsense")
+        raise AssertionError("an unknown detail should be refused")
+    except ValueError:
+        print("  refuses an unknown detail value.")
 
     print("\n=== get_brief(category=...): load one category, not the project ===")
     store.update_summary("Python 3.13, FastAPI, Chroma.", category="tech_stack",

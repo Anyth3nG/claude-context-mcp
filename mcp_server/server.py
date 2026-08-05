@@ -86,8 +86,26 @@ def _auth_settings(verifier) -> "AuthSettings | None":
 _token_verifier = verifier_from_env()
 OAUTH_ENABLED = _token_verifier is not None
 
+# Delivered to the client with the server's capabilities, BEFORE any tool call.
+# It is the only thing here that reaches a session without being asked for, which
+# makes it the whole answer to "nothing makes a new session look".
+#
+# Deliberately STATIC — no project list, no counts. Those would have to be built
+# at import, and SnapStart snapshots init at publish time, so a project added
+# next week would not appear until a redeploy and an alias move (the same trap
+# documented in config/rotation). The live numbers belong in get_index, which is
+# one cheap call away; this text only has to make that call happen.
+#
+# Every session pays for this, so it stays short.
+INSTRUCTIONS = """Durable memory for this user, shared across every machine and both clients (Claude Code and claude.ai). Context saved in another session is available in this one — do NOT assume it is empty, and do not re-derive what may already be recorded.
+
+Open with get_index(detail="projects"): a table of contents for tens of tokens. Then go only as deep as the task needs — get_brief(project), get_brief(project, category) to narrow it, get_value for one slot, get_history for how a slot changed, search_context when you don't know where to look.
+
+Write sparingly: patch_context revises a fact that already has a value, add_update appends a new one. Decisions worth having later, not conversation."""
+
 mcp = MCPServer(
     "context-mcp",
+    instructions=INSTRUCTIONS,
     token_verifier=_token_verifier,
     auth=_auth_settings(_token_verifier),
 )
