@@ -34,6 +34,7 @@ from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRI
 from mcp_server.tools.get_index import DESCRIPTION as GET_INDEX_DESCRIPTION, get_index
 from mcp_server.tools.get_brief import DESCRIPTION as GET_BRIEF_DESCRIPTION, get_brief
 from mcp_server.tools.get_value import DESCRIPTION as GET_VALUE_DESCRIPTION, get_value
+from mcp_server.tools.get_history import DESCRIPTION as GET_HISTORY_DESCRIPTION, get_history
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
 from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
 from mcp_server.tools.patch_context import DESCRIPTION as PATCH_CONTEXT_DESCRIPTION, patch_context
@@ -97,6 +98,11 @@ mcp = MCPServer(
 mcp.add_tool(get_index, description=GET_INDEX_DESCRIPTION)
 mcp.add_tool(get_brief, description=GET_BRIEF_DESCRIPTION)
 mcp.add_tool(get_value, description=GET_VALUE_DESCRIPTION)
+# Between get_value and search_context by design: it answers "how did this
+# known slot change" deterministically, which is the question people reach for
+# search_context to answer and get ranking and truncation instead. Search stays
+# the tool for when you do NOT know where to look.
+mcp.add_tool(get_history, description=GET_HISTORY_DESCRIPTION)
 mcp.add_tool(search_context, description=SEARCH_CONTEXT_DESCRIPTION)
 # Write side, in the order they should be reached for: add_update appends
 # history, patch_context edits current state in place, change_update rewrites a
