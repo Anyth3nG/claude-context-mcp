@@ -38,6 +38,7 @@ from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, a
 from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
 from mcp_server.tools.patch_context import DESCRIPTION as PATCH_CONTEXT_DESCRIPTION, patch_context
 from mcp_server.tools.retire_chunk import DESCRIPTION as RETIRE_CHUNK_DESCRIPTION, retire_chunk
+from mcp_server.tools.archive_slot import DESCRIPTION as ARCHIVE_SLOT_DESCRIPTION, archive_slot
 
 # python-dotenv isn't in the Lambda bundle — there's no .env there. Import it
 # optionally so the same module works in both places.
@@ -111,6 +112,12 @@ mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
 # ranking against the entry that corrected it, with nothing marking which is
 # which — the failure the 2026-08-05 retrieval check surfaced.
 mcp.add_tool(retire_chunk, description=RETIRE_CHUNK_DESCRIPTION)
+# The other half of the same idea: retire_chunk says a fact was WRONG,
+# archive_slot says a slot's work is FINISHED. Both take something out of the
+# default read; only the first is a correction. Without this, `goal` had no way
+# to distinguish what needs doing from what was done, and completed phases kept
+# loading with every brief.
+mcp.add_tool(archive_slot, description=ARCHIVE_SLOT_DESCRIPTION)
 
 # /map and /map/data are NOT registered. Custom routes bypass MCP-level auth by
 # design, and /map/data serves the entire store — so they needed a guard of
