@@ -137,7 +137,7 @@ mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
 mcp.add_tool(retire_chunk, description=RETIRE_CHUNK_DESCRIPTION)
 # The other half of the same idea: retire_chunk says a fact was WRONG,
 # archive_slot says a slot's work is FINISHED. Both take something out of the
-# default read; only the first is a correction. Without this, `goal` had no way
+# default read; only the first is a correction. Without this, `tasks` had no way
 # to distinguish what needs doing from what was done, and completed phases kept
 # loading with every brief.
 mcp.add_tool(archive_slot, description=ARCHIVE_SLOT_DESCRIPTION)

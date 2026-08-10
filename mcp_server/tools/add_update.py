@@ -34,7 +34,7 @@ Use add_update for point-in-time facts that ACCUMULATE: a decision made, an even
 
 Use patch_context INSTEAD when revising the CURRENT STATE of something that already has a value. Appending a corrected version here leaves the outdated one in place, and future sessions must then read both and guess which still holds.
 
-Save when: a real decision gets made, the user states a lasting preference or fact about themselves, or sets or updates a goal.
+Save when: a real decision gets made, the user states a lasting preference or fact about themselves, or sets or updates a task.
 
 Do NOT save: hypotheticals or options weighed but not chosen, restatements of something already in THIS store (check with search_context), transient debugging detail, or anything you're unsure is worth surfacing again. When in doubt, don't — a missed save is cheap to redo; a bad save pollutes retrieval permanently."""
 
@@ -53,7 +53,7 @@ def add_update(
         str,
         Field(
             description="tech_stack, architecture, config, or decisions for project-scoped entries; "
-            "preference, fact, goal, or note for general ones. Close typos are auto-corrected."
+            "preference, fact, tasks, or note for general ones. Close typos are auto-corrected."
         ),
     ],
     project: Annotated[

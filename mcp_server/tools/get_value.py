@@ -26,7 +26,7 @@ def get_value(
         str,
         Field(
             description="Which category to fetch: tech_stack, architecture, config or decisions "
-            "for project-scoped entries; preference, fact, goal or note for general ones. "
+            "for project-scoped entries; preference, fact, tasks or note for general ones. "
             "Close typos are auto-corrected."
         ),
     ],

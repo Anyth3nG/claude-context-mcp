@@ -29,19 +29,24 @@ Project-scoped:
 General (`project = null`):
 - `preference` — how you like things done, working style
 - `fact` — durable facts about you
-- `goal` — things you're working toward or considering
+- `tasks` — things that need doing, each under a titled key
 - `note` — anything that doesn't fit the above but is worth keeping
 
 This list is expected to grow. Adding a category is cheap — a one-line change
 to `VALID_CATEGORIES` in `shared/store.py` — but it must be deliberate, not a
 typo that silently creates a bucket filtered queries can never find. Removing
-or renaming a category means a migration pass over existing data.
+or renaming a category means a migration pass over existing data — see
+`scripts/migrate_goal_to_tasks.py`, which renamed `goal` to `tasks` on
+2026-08-10 and is the reference for how to do it: summaries carry the category
+in their id and must be re-added under a new one, everything else needs only a
+metadata update, and the existing embedding is reused because the text is
+unchanged.
 
 The project/general grouping above is **guidance, not enforcement**:
 `VALID_CATEGORIES` is one flat set, and any category may be used with or
 without a project. It reflects where each category usually belongs, not a
-constraint the code applies. In practice `goal` is used project-scoped to hold
-a project's roadmap — which is genuinely a goal that belongs to a project — and
+constraint the code applies. In practice `tasks` is used project-scoped to hold
+a project's outstanding work — which genuinely belongs to a project — and
 `get_brief` returns every summary for a project regardless of which group its
 category nominally sits in.
 
@@ -154,7 +159,7 @@ Replacement requires the caller to reproduce the entire new document — so
 altering one line of a 1,000-token summary means *generating* 1,000 tokens, the
 expensive and slow kind, to move a few characters. A patch sends only the diff.
 Measured against this store's own summaries at the time of the change:
-`context-mcp/config` was 966 tokens and `context-mcp/goal` 1,363, so every
+`context-mcp/config` was 966 tokens and `context-mcp/goal` (now `tasks`) 1,363, so every
 correction to either paid four figures of output tokens regardless of size.
 
 Patching is also the safer operation, which is why its guardrails are lighter:

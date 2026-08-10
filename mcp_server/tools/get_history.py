@@ -35,7 +35,7 @@ def get_history(
         str,
         Field(
             description="Which category the slot lives in: tech_stack, architecture, config, "
-            "decisions for project-scoped entries; preference, fact, goal, note for general ones."
+            "decisions for project-scoped entries; preference, fact, tasks, note for general ones."
         ),
     ],
     project: Annotated[
