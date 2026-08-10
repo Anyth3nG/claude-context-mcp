@@ -25,8 +25,12 @@
 #     configuration. MCP_ALLOWED_HOST must be the exact API Gateway hostname —
 #     "*" is not a wildcard and yields HTTP 421.
 #   - An IAM role assumable by this repo via GitHub's OIDC provider, with
-#     permission to UpdateFunctionCode, PublishVersion and UpdateAlias on that
-#     function. Its ARN goes in the AWS_DEPLOY_ROLE_ARN repository secret.
+#     permission to UpdateFunctionCode, PublishVersion, UpdateAlias and
+#     ListVersionsByFunction on that function, plus DeleteFunction scoped to
+#     the QUALIFIED ARN only (`function:context-mcp:*`, never the bare
+#     `function:context-mcp`) so the prune step below can delete versions but
+#     cannot delete the function itself. Its ARN goes in the
+#     AWS_DEPLOY_ROLE_ARN repository secret.
 
 name: Deploy
 
@@ -137,6 +141,55 @@ jobs:
             --name "$ALIAS" \
             --function-version "${{ steps.publish.outputs.version }}" \
             --no-cli-pager
+
+      - name: Prune superseded versions
+        run: |
+          set -euo pipefail
+          # SnapStart bills cached-snapshot storage PER PUBLISHED VERSION, for as
+          # long as the snapshot lives (it is dropped only after 14 days without
+          # an invocation), whether or not that version ever serves traffic. Every
+          # push here publishes a version, so without this step the storage bill
+          # tracks how often we deploy rather than how much traffic we serve — it
+          # reached ~$0.70/day on 17 versions, 16 of which were dead.
+          #
+          # Two versions are kept, not one: the version the alias serves, and the
+          # newest one behind it as a rollback target. Recovering from a bad
+          # deploy is then `update-alias` back onto the spare, rather than a
+          # revert commit and a full redeploy. The second snapshot costs roughly
+          # one version's storage, which is small next to paying for every version
+          # ever published.
+          #
+          # This runs last on purpose: only after the new version reached Active
+          # (snapshot built) and the alias actually moved onto it. The guard below
+          # re-reads the alias rather than trusting the earlier step, so a partial
+          # or raced deploy prunes nothing.
+          #
+          # NOTE: `delete-function` WITHOUT --qualifier deletes the entire
+          # function. Every call here is qualified, and the deploy role only holds
+          # DeleteFunction on the qualified ARN, so an unqualified call would be
+          # denied by IAM as well.
+          live=$(aws lambda get-alias \
+            --function-name "$FUNCTION_NAME" \
+            --name "$ALIAS" \
+            --query FunctionVersion --output text)
+          if [ "$live" != "${{ steps.publish.outputs.version }}" ]; then
+            echo "alias $ALIAS points at $live, not the version just published; not pruning"
+            exit 1
+          fi
+          versions=$(aws lambda list-versions-by-function \
+            --function-name "$FUNCTION_NAME" \
+            --query 'Versions[?Version!=`$LATEST`].Version' --output text)
+          # Highest-numbered version that is not the live one. Empty on the very
+          # first deploy, when there is nothing yet to roll back to.
+          spare=$(echo "$versions" | tr '\t' '\n' | grep -vx "$live" | sort -n | tail -1 || true)
+          for v in $versions; do
+            if [ "$v" = "$live" ] || [ "$v" = "$spare" ]; then
+              continue
+            fi
+            aws lambda delete-function --function-name "$FUNCTION_NAME" --qualifier "$v"
+            echo "pruned version $v"
+          done
+          echo "kept version $live (alias $ALIAS)${spare:+, rollback spare $spare}"
 
       - name: Report
         run: |
