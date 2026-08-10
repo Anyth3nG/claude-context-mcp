@@ -28,8 +28,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from shared.config import load_secrets
 
 from mcp_server.auth import REASON_NO_TOKEN, log_auth_rejection, verifier_from_env
-# map_routes is intentionally not imported — see the note where the tools are
-# registered below.
+from mcp_server.map_routes import register_map_routes
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
 from mcp_server.tools.get_index import DESCRIPTION as GET_INDEX_DESCRIPTION, get_index
 from mcp_server.tools.get_brief import DESCRIPTION as GET_BRIEF_DESCRIPTION, get_brief
@@ -143,18 +142,15 @@ mcp.add_tool(retire_chunk, description=RETIRE_CHUNK_DESCRIPTION)
 # loading with every brief.
 mcp.add_tool(archive_slot, description=ARCHIVE_SLOT_DESCRIPTION)
 
-# /map and /map/data are NOT registered. Custom routes bypass MCP-level auth by
-# design, and /map/data serves the entire store — so they needed a guard of
-# their own, which was the static bearer token. That token is gone (see
-# auth.py), and these routes have no OAuth flow to fall back on: a browser
-# navigation cannot send an Authorization header, which is why the map was
-# already unreachable from a browser. Registering them now would publish the
-# whole store unauthenticated.
+# /map is registered again as of 2026-08-10, with the browser-compatible auth
+# path it always needed: a Cognito hosted-UI login terminating in a session
+# cookie, verified by the same CognitoTokenVerifier that guards /mcp. See
+# map_routes.py for why the guard lives inside the handlers — custom routes
+# bypass MCP-level auth by design, so nothing above them protects the store.
 #
-# map_routes.py and static/map.html are kept deliberately — they are the
-# starting point for the rebuild, where auth is designed in rather than bolted
-# on. Re-enable only together with a real browser-compatible auth path.
-# register_map_routes(mcp)
+# /map/data is deliberately NOT a route. The page inlines its data, so there is
+# no second endpoint serving the store and no fetch to authorize separately.
+register_map_routes(mcp)
 
 
 def _transport_security() -> TransportSecuritySettings:
@@ -196,13 +192,25 @@ class RejectStreamGet:
     asking, and a 405 discloses nothing — it says only that this endpoint speaks
     POST, which its own protocol documentation already says. Answering 401 first
     would mean an authenticated client still had to discover the hang.
+
+    SCOPED TO ONE PATH, and that is not a detail. This originally matched on
+    method alone, which was invisible while /mcp was the only route anyone
+    reached by GET — but it meant every other GET in the app got the same 405,
+    including the OAuth protected-resource metadata the SDK serves and, once it
+    was registered, the whole of /map. A GET elsewhere is not a client trying to
+    open a stream, and answering it here says nothing true about it.
     """
 
-    def __init__(self, app):
+    def __init__(self, app, path: str = "/mcp"):
         self.app = app
+        self.path = path
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("method") == "GET":
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path") == self.path
+        ):
             await send(
                 {
                     "type": "http.response.start",
@@ -282,10 +290,10 @@ def build_asgi_app():
     """
     Stateless streamable-HTTP app. Fresh instance per call.
 
-    No auth wrapper here any more: /mcp is guarded by the MCP layer itself
-    against Cognito, and the only routes that ever needed a separate gate were
-    /map*, which are no longer registered. The one wrapper that remains logs
-    rejections; it never decides them.
+    No auth wrapper here: /mcp is guarded by the MCP layer itself against
+    Cognito, and /map carries its own guard inside its handlers because custom
+    routes bypass that layer by design (see map_routes.py). The one wrapper
+    that remains logs rejections; it never decides them.
 
     That leaves one gap worth being loud about — if Cognito is not configured,
     the MCP layer has nothing to verify against and this app serves the store
