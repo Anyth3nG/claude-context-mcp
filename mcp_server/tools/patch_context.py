@@ -46,7 +46,7 @@ def patch_context(
         str,
         Field(
             description="Which slot to edit: tech_stack, architecture, config, or decisions for "
-            "project-scoped entries; preference, fact, goal, or note for general ones. "
+            "project-scoped entries; preference, fact, tasks, or note for general ones. "
             "Close typos are auto-corrected."
         ),
     ],

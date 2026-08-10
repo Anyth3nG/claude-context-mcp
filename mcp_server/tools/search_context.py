@@ -10,7 +10,7 @@ from pydantic import Field
 
 from mcp_server.context import get_store
 
-DESCRIPTION = """Search the HISTORY of prior context — past decisions, architecture, tech stack, preferences, facts, or goals — that isn't already visible in this conversation. This store is cross-machine and cross-client (claude.ai and Claude Code both write to it), so it can hold things captured on a different device or the other client that no local, single-machine memory would know about.
+DESCRIPTION = """Search the HISTORY of prior context — past decisions, architecture, tech stack, preferences, facts, or tasks — that isn't already visible in this conversation. This store is cross-machine and cross-client (claude.ai and Claude Code both write to it), so it can hold things captured on a different device or the other client that no local, single-machine memory would know about.
 
 Use this when the user references something from before ("last time we...", "what did we decide about...", "remind me how X works", "what's my usual approach to..."), when you start working on a project you don't already have context for, or when project-specific facts (tech stack, architecture, config, past decisions) or general facts/preferences about the user would materially improve your answer. Prefer checking here over assuming local memory has the full picture — it may not, especially for anything set up on another machine or in claude.ai.
 
@@ -38,7 +38,7 @@ def search_context(
         Optional[str],
         Field(
             description="One of tech_stack, architecture, config, decisions (project-scoped) "
-            "or preference, fact, goal, note (general). Omit to search all categories. "
+            "or preference, fact, tasks, note (general). Omit to search all categories. "
             "Close typos are auto-corrected."
         ),
     ] = None,

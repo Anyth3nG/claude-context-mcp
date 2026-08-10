@@ -25,7 +25,7 @@ VALID_CATEGORIES = {
     "decisions",
     "preference",
     "fact",
-    "goal",
+    "tasks",
     "note",
 }
 VALID_TYPES = {"summary", "chunk"}
@@ -1817,7 +1817,7 @@ if __name__ == "__main__":
     print(f"  whole project {whole_chars} chars -> one category {one_chars} chars")
     assert store.get_brief("tiers", category="architecure")[0]["category"] == "architecture", \
         "a near-miss category should still resolve"
-    assert store.get_brief("tiers", category="goal") == [], "a category with no slots is empty, not an error"
+    assert store.get_brief("tiers", category="tasks") == [], "a category with no slots is empty, not an error"
     print("  typo corrected, empty category returns cleanly.")
 
     print("\n=== slot_history: a known slot's past, without guessing at words ===")
@@ -1858,18 +1858,18 @@ if __name__ == "__main__":
 
     print("\n=== archive_slot: finished work leaves the brief but stays retrievable ===")
     store.update_summary("PHASE X - do the thing. DONE, shipped as abc1234.",
-                         category="goal", project="archtest", tier="personal", key="phase-x")
+                         category="tasks", project="archtest", tier="personal", key="phase-x")
     store.update_summary("PHASE Y - still outstanding.",
-                         category="goal", project="archtest", tier="personal", key="phase-y",
+                         category="tasks", project="archtest", tier="personal", key="phase-y",
                          create_key=True)
     before = store.index(project="archtest")["projects"]["archtest"]
-    assert "goal/phase-x" in before["summaries"] and "goal/phase-y" in before["summaries"]
-    arch = store.archive_slot(project="archtest", category="goal", key="phase-x",
+    assert "tasks/phase-x" in before["summaries"] and "tasks/phase-y" in before["summaries"]
+    arch = store.archive_slot(project="archtest", category="tasks", key="phase-x",
                               reason="Completed 2026-08-05; detail is history, not current state.")
     after = store.index(project="archtest")["projects"]["archtest"]
     assert arch["archived"] and arch["chars_freed"] > 0
-    assert "goal/phase-x" not in after["summaries"], "archived slot must leave the index"
-    assert "goal/phase-y" in after["summaries"], "archiving one slot must not touch another"
+    assert "tasks/phase-x" not in after["summaries"], "archived slot must leave the index"
+    assert "tasks/phase-y" in after["summaries"], "archiving one slot must not touch another"
     assert after["brief_chars"] < before["brief_chars"]
     assert not any(e["key"] == "phase-x" for e in store.get_brief("archtest")), \
         "archived slot must leave get_brief — that is the whole point"
@@ -1887,7 +1887,7 @@ if __name__ == "__main__":
     print("  recoverable via include_superseded, flagged superseded not retired.")
 
     try:
-        store.archive_slot(project="archtest", category="goal", key="never-existed")
+        store.archive_slot(project="archtest", category="tasks", key="never-existed")
         raise AssertionError("archiving a missing slot should have been refused")
     except PatchSlotMissing:
         print("  refuses a slot that does not exist.")

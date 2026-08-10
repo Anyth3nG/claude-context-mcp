@@ -44,7 +44,7 @@ def get_brief(
         Optional[str],
         Field(
             description="Load only this category: tech_stack, architecture, config or decisions "
-            "for project-scoped entries; preference, fact, goal or note for general ones. Omit "
+            "for project-scoped entries; preference, fact, tasks or note for general ones. Omit "
             "for the whole project. Close typos are auto-corrected."
         ),
     ] = None,
