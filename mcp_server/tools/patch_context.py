@@ -58,7 +58,7 @@ def patch_context(
         Optional[str],
         Field(
             description="Sub-topic within the category, e.g. 'cognito' or 'deploy' under config. "
-            "Omit for the category's main slot. Use get_index to see which keys already exist — "
+            "REQUIRED — every summary lives under a key; there is no keyless main slot. Use get_index to see which keys already exist — "
             "reuse an existing one rather than coining a synonym, or the category fragments."
         ),
     ] = None,

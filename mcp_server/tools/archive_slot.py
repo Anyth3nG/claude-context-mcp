@@ -22,13 +22,13 @@ from mcp_server.review_log import log_write
 
 DESCRIPTION = """Retire a summary slot whose work is FINISHED, so it stops loading with every brief while staying retrievable.
 
-Use this when a slot has stopped describing current state and started describing history — most often a finished piece of work. `tasks` is meant to answer "what needs doing next"; once something is done, its detail is a record of what happened, and leaving it live means every future session pays for it on every get_brief.
+Use this when a slot has stopped describing current state and started describing history — most often a finished piece of work. `tasks` is meant to answer "what needs doing next"; once something is done, its detail is a record of what happened, and leaving it live means every future session pays for it on every get_context.
 
 The text is not deleted. It is archived as a SUPERSEDED chunk, keeping its existing embedding, and comes back through search_context with include_superseded=True — which is how you compare what exists now against what was worked on before.
 
 DO use this for: a finished piece of work, a task that has been done, a config surface that no longer exists, any slot that has become purely historical.
 
-Do NOT use this for a slot that is merely long, out of date, or partly wrong. Long belongs in patch_context, out of date belongs in patch_context or change_update, and wrong belongs in retire_chunk. Archiving something still in use makes it invisible to get_brief, and a future session will not know to ask for it.
+Do NOT use this for a slot that is merely long, out of date, or partly wrong. Long belongs in patch_context, out of date belongs in patch_context or change_update, and wrong belongs in retire_chunk. Archiving something still in use makes it invisible to get_context, and a future session will not know to ask for it.
 
 Leave a `reason` — it is stored on the archived copy and is what tells a later reader why this stopped being current rather than having been abandoned."""
 
@@ -49,7 +49,7 @@ def archive_slot(
         Optional[str],
         Field(
             description="Sub-topic within the category, e.g. 'browser-login' under tasks. "
-            "Omit for the category's main slot."
+            "REQUIRED — every summary lives under a key; there is no keyless main slot. get_index lists the ones in use."
         ),
     ] = None,
     reason: Annotated[

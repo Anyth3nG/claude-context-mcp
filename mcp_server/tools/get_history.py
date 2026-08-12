@@ -46,7 +46,7 @@ def get_history(
         Optional[str],
         Field(
             description="Sub-topic within the category, e.g. 'rotation' under config. "
-            "Omit for the category's main slot."
+            "REQUIRED — every summary lives under a key; there is no keyless main slot. get_index lists the ones in use."
         ),
     ] = None,
 ) -> dict:

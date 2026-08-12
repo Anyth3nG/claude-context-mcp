@@ -131,6 +131,29 @@ class UnknownSummaryKey(Exception):
         )
 
 
+class MissingSummaryKey(Exception):
+    """
+    A summary write arrived without a key.
+
+    Its own class rather than a bare ValueError so the tool layer can catch it
+    precisely and answer with the keys already in use — the caller almost always
+    meant one of them. A blanket `except ValueError` there would also swallow a
+    bad tier or an unusable key slug and report all three as the same thing.
+    """
+
+    def __init__(self, project: str, category: str, existing: list):
+        self.project = project
+        self.category = category
+        self.existing = existing
+        shown = ", ".join(repr(k) for k in existing if k) or "none yet"
+        super().__init__(
+            f"key is required — every summary lives under one (project, category, key). "
+            f"A keyless slot in '{category}' would make get_context(project, category) "
+            f"ambiguous between the category's own summary and everything filed under it. "
+            f"Keys already in use under {project}/{category}: {shown}."
+        )
+
+
 class PatchFailed(Exception):
     """
     Base for every reason a patch was not applied.
@@ -253,6 +276,10 @@ def _normalize_key(key: Optional[str]) -> Optional[str]:
     `lambda-settings` are the same slot; `lambda` and `compute` are not, and no
     amount of string handling can decide whether they should be. That judgment
     is pushed to the caller by UnknownSummaryKey instead.
+
+    None passes through rather than raising, because this sits on read paths too
+    and a keyless lookup should return not-found, not blow up. Writes are where
+    the requirement bites: update_summary rejects a None key outright.
     """
     if key is None:
         return None
@@ -537,10 +564,11 @@ class ContextStore:
         Every key currently in use under one project+category, `None` first if an
         unkeyed slot exists.
 
-        The unkeyed slot is listed alongside the keys on purpose: during a split
-        it is the thing a new key is most likely to duplicate, and leaving it out
-        of the picture is how a category ends up with both `config` and
-        `config-lambda` saying different things about the same subject.
+        Since 2026-08-12 update_summary refuses a keyless write, so `None` can no
+        longer appear on anything written after that date. The handling stays for
+        data predating the migration: a store restored from an older backup still
+        reads correctly, and a `None` in this list is the signal that it has not
+        been migrated rather than a crash.
         """
         category, _ = _normalize_category(category)
         got = self.collection.get(
@@ -1221,7 +1249,7 @@ class ContextStore:
                 "projects": toc,
                 "total_summaries": len(summaries["ids"]),
                 "total_history_chunks": len(chunks["ids"]),
-                "next": "get_brief(project) for one project's current state, "
+                "next": "get_context(project) for one project's current state, "
                         "or get_index(project=...) for its individual slots.",
             }
 
@@ -1259,6 +1287,16 @@ class ContextStore:
         """
         category, corrected_from = _normalize_category(category)
         key = _normalize_key(key)
+        if key is None:
+            # No keyless "main slot" — see decisions/no-keyless-slots. While a
+            # category could hold both, get_context(project, category) was
+            # ambiguous between "the category's own summary" and "everything
+            # filed under it". Requiring a key makes that unrepresentable rather
+            # than resolved by convention. Reads stay permissive: a keyless
+            # lookup returns not-found, which is honest, since none can exist.
+            raise MissingSummaryKey(
+                project or "general", category, self.summary_keys(project, category)
+            )
         project_key = project or "general"
         if not project:
             tier = None  # tier is meaningless without a project
@@ -1721,11 +1759,26 @@ if __name__ == "__main__":
             pass
     print("OK, empty/punctuation-only/reserved/over-long keys rejected.")
 
-    print("\n=== Creating the FIRST key in a populated category is refused ===")
+    print("\n=== A keyless write is refused outright ===")
+    try:
+        store.update_summary(
+            document="Runs on Lambda: python3.13, arm64, 512MB, 30s timeout, SnapStart on.",
+            category="config", project="keytest", tier="personal",
+        )
+        print("FAIL: a keyless summary was created")
+        raise SystemExit(1)
+    except MissingSummaryKey as refusal:
+        assert "key is required" in str(refusal)
+        print(f"OK, refused: {refusal}")
+
+    print("\n=== The FIRST key in an empty category needs no create_key ===")
     store.update_summary(
         document="Runs on Lambda: python3.13, arm64, 512MB, 30s timeout, SnapStart on.",
-        category="config", project="keytest", tier="personal",
+        category="config", project="keytest", tier="personal", key="lambda",
     )
+    print("OK, keytest/config/lambda opened the category.")
+
+    print("\n=== A SECOND key in a populated category is refused without create_key ===")
     try:
         store.update_summary(
             document="Cognito pool with two app clients, PKCE for the public one.",
@@ -1735,7 +1788,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     except UnknownSummaryKey as refusal:
         print(f"OK, refused. existing={refusal.existing}")
-        assert None in refusal.existing, "the unkeyed slot must be offered as a candidate"
+        assert "lambda" in refusal.existing, "the existing key must be offered as a candidate"
 
     print("\n=== create_key=True lets it through, and the slots are independent ===")
     store.update_summary(
@@ -1746,10 +1799,11 @@ if __name__ == "__main__":
         document="Alarm at 5 rejections per 300s, SNS topic context-mcp-alerts.",
         category="config", project="keytest", tier="personal", key="alerting", create_key=True,
     )
-    assert store.summary_keys("keytest", "config") == [None, "alerting", "cognito"]
-    unkeyed = store.get_summary("keytest", "config")[0]
-    assert "Lambda" in unkeyed and "Cognito" not in unkeyed, "writing a key touched the main slot"
-    print(f"OK, keys = {store.summary_keys('keytest', 'config')}, main slot untouched.")
+    assert store.summary_keys("keytest", "config") == ["alerting", "cognito", "lambda"]
+    assert None not in store.summary_keys("keytest", "config"), "no keyless slot may exist"
+    first = store.get_summary("keytest", "config", key="lambda")[0]
+    assert "Lambda" in first and "Cognito" not in first, "writing a key touched another key's slot"
+    print(f"OK, keys = {store.summary_keys('keytest', 'config')}, slots independent.")
 
     print("\n=== Writing to an EXISTING key needs no create_key, and patch is key-aware ===")
     store.update_summary(
@@ -1762,7 +1816,10 @@ if __name__ == "__main__":
     )
     assert res["id"] == "keytest-config-cognito-summary"
     assert "three app clients" in store.get_summary("keytest", "config", key="cognito")[0]
-    assert "Lambda" in store.get_summary("keytest", "config")[0]
+    assert "Lambda" in store.get_summary("keytest", "config", key="lambda")[0], \
+        "patching one key must leave its siblings alone"
+    assert store.get_summary("keytest", "config") is None, \
+        "a keyless lookup must be not-found, never a fallback to some other slot"
     print(f"OK, patched {res['id']} only.")
 
     print("\n=== Refusal ranks existing keys by CONTENT, closest first ===")
@@ -1776,10 +1833,12 @@ if __name__ == "__main__":
     brief = store.get_brief("keytest")
     labels = [(e["category"], e["key"]) for e in brief]
     print(f"  brief slots: {labels}")
-    assert ("config", None) in labels and ("config", "cognito") in labels
+    assert ("config", "lambda") in labels and ("config", "cognito") in labels
+    assert all(k for _, k in labels), "every brief entry must carry a key"
     keyed_index = store.index(project="keytest")["projects"]["keytest"]["summaries"]
     print(f"  index labels: {sorted(keyed_index)}")
-    assert "config" in keyed_index and "config/cognito" in keyed_index
+    assert "config/lambda" in keyed_index and "config/cognito" in keyed_index
+    assert "config" not in keyed_index, "a bare category label means a keyless slot exists"
 
     print("\n=== index(detail='projects'): the table of contents a session opens with ===")
     import json as _json
@@ -1803,11 +1862,11 @@ if __name__ == "__main__":
 
     print("\n=== get_brief(category=...): load one category, not the project ===")
     store.update_summary("Python 3.13, FastAPI, Chroma.", category="tech_stack",
-                         project="tiers", tier="personal")
+                         project="tiers", tier="personal", key="overview")
     store.update_summary("OAuth only, no shared credential.", category="architecture",
-                         project="tiers", tier="personal")
+                         project="tiers", tier="personal", key="auth")
     store.update_summary("Alarm at 5 per 300s.", category="config",
-                         project="tiers", tier="personal")
+                         project="tiers", tier="personal", key="alerting")
     whole = store.get_brief("tiers")
     one = store.get_brief("tiers", category="architecture")
     assert len(whole) == 3 and len(one) == 1 and one[0]["category"] == "architecture"
@@ -1931,8 +1990,10 @@ if __name__ == "__main__":
         "retired chunks must not be counted as live history"
     print("  metadata recorded, idempotent, excluded from the index count.")
 
-    store.update_summary("A live summary.", category="config", project="retiretest", tier="personal")
-    for bad_id, label in [(store.summary_id("retiretest", "config"), "a summary"), ("chunk-nope", "a missing id")]:
+    store.update_summary("A live summary.", category="config", project="retiretest",
+                         tier="personal", key="alerting")
+    for bad_id, label in [(store.summary_id("retiretest", "config", "alerting"), "a summary"),
+                          ("chunk-nope", "a missing id")]:
         try:
             store.retire_chunk(bad_id, reason="x")
             raise AssertionError(f"retiring {label} should have been refused")

@@ -38,10 +38,18 @@
 #
 #   /mcp       OAuth via Cognito, and nothing else. Both claude.ai and Claude
 #              Code get their own app client. There is no fallback credential.
-#   /map*      NOT SERVED. These routes bypass MCP-level auth by design and
-#              /map/data returns the entire store, so they depended on the
-#              static AUTH_TOKEN — which no longer exists. They stay
-#              unregistered until they have a browser-compatible auth path.
+#   /map       Cognito hosted-UI login, guarded inside the handlers rather than
+#              at MCP level, because custom routes bypass that layer by design.
+#              A session cookie scoped to /map, set after a code exchange at
+#              /map/callback. Served since 2026-08-10; before that it was
+#              unregistered, having depended on the deleted static AUTH_TOKEN.
+#   /map/data  NOT A ROUTE. It returned the whole store, so rather than guard
+#              it, the page inlines its data and the endpoint is gone.
+#
+# NOTE: the map's own app client is NOT provisioned by this script, and the
+# three variables it reads — MAP_CLIENT_ID, MAP_CLIENT_SECRET,
+# MAP_COGNITO_DOMAIN — are set out of band on the function. Everything else
+# here is reproducible from this file; that part is not, yet.
 #
 # There is deliberately no shared password anywhere in this deployment. A
 # static token cannot expire, cannot be revoked per device, and caps the

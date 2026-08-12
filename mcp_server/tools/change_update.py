@@ -20,7 +20,7 @@ from typing import Annotated, Optional
 
 from pydantic import Field
 
-from shared.store import SummaryShrinkRefused, UnknownSummaryKey
+from shared.store import MissingSummaryKey, SummaryShrinkRefused, UnknownSummaryKey
 
 from mcp_server.context import get_store
 from mcp_server.review_log import log_write
@@ -61,7 +61,7 @@ def change_update(
         Optional[str],
         Field(
             description="Sub-topic within the category, e.g. 'cognito' or 'deploy' under config. "
-            "Omit for the category's main slot. Use get_index to see which keys already exist — "
+            "REQUIRED — every summary lives under a key; there is no keyless main slot. Use get_index to see which keys already exist — "
             "reuse an existing one rather than coining a synonym, or the category fragments."
         ),
     ] = None,
@@ -108,6 +108,17 @@ def change_update(
             "existing_keys": [k if k else "(unkeyed)" for k in refusal.existing],
             "hint": "Reuse whichever of these already means the same thing, or resend "
                     "with create_key=true if this really is a new topic.",
+        }
+    except MissingSummaryKey as refusal:
+        # Returned like the others: the caller usually meant one of the keys
+        # already in the category, so hand those back rather than only saying no.
+        return {
+            "changed": False,
+            "refused": "missing_key",
+            "reason": str(refusal),
+            "existing_keys": [k for k in refusal.existing if k],
+            "hint": "Resend with a key. Reuse an existing one if it means the same thing, "
+                    "or add create_key=true alongside a new key for a genuinely new topic.",
         }
     except SummaryShrinkRefused as refusal:
         # Returned rather than raised: the model needs the current text in order
