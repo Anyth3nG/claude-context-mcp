@@ -14,7 +14,7 @@ DESCRIPTION = """Search the HISTORY of prior context — past decisions, archite
 
 Use this when the user references something from before ("last time we...", "what did we decide about...", "remind me how X works", "what's my usual approach to..."), when you start working on a project you don't already have context for, or when project-specific facts (tech stack, architecture, config, past decisions) or general facts/preferences about the user would materially improve your answer. Prefer checking here over assuming local memory has the full picture — it may not, especially for anything set up on another machine or in claude.ai.
 
-For CURRENT STATE, use get_brief or get_value instead — "what is the stack", "how is this set up", "what does this project do". This tool ranks by similarity and truncates each hit to ~800 characters, so a long entry is only ever partly visible; get_brief and get_value are direct lookups and return whole documents. Use this tool for questions about history and reasoning: "what did we decide about X", "why did we choose Y", "when did Z change".
+For CURRENT STATE, use get_context instead — "what is the stack", "how is this set up", "what does this project do". This tool ranks by similarity and truncates each hit to ~800 characters, so a long entry is only ever partly visible; get_context is a direct lookup and returns whole documents. Use this tool for questions about history and reasoning: "what did we decide about X", "why did we choose Y", "when did Z change".
 
 Do NOT use this for general knowledge questions, for things already stated earlier in this same conversation, or as a substitute for reasoning about what's already in front of you — only to retrieve durable context saved in a previous session.
 

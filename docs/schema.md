@@ -47,7 +47,7 @@ The project/general grouping above is **guidance, not enforcement**:
 without a project. It reflects where each category usually belongs, not a
 constraint the code applies. In practice `tasks` is used project-scoped to hold
 a project's outstanding work — which genuinely belongs to a project — and
-`get_brief` returns every summary for a project regardless of which group its
+`get_context` returns every summary for a project regardless of which group its
 category nominally sits in.
 
 ## Collection structure in ChromaDB
@@ -214,9 +214,17 @@ they should be reached for:
 | Tool | Cost against this store | Answers |
 |---|---|---|
 | `get_index` | ~114 tokens | what exists, how big, how stale |
-| `get_value` | one category | what does X currently say |
-| `get_brief` | ~4,280 tokens (one project) | everything, whole |
+| `get_context(p, cat, key)` | one slot | what does this one slot say |
+| `get_context(p, cat)` | one category | what does X currently say |
+| `get_context(p)` | ~4,280 tokens (one project) | everything, whole |
 | `search_context` | ranked, truncated | history and reasoning |
+
+`get_context` was two tools until 2026-08-12, `get_brief` and `get_value`. They
+differed only in how much they returned — both deterministic lookups handing
+back whole documents — so depth now comes from how much of the address is
+supplied. The merge needed the keyless main slot gone first: while a category
+could hold both a keyless slot and keyed ones, `(project, category)` meant
+either "the category's own summary" or "everything filed under it".
 
 `ContextStore.index()` returns the map without any of the contents: one line per
 summary slot with its size and last-write date, plus a count of history chunks.
@@ -225,8 +233,8 @@ than similarity queries — and it stays small as the store grows, because there
 is only ever one living summary per project+category no matter how much history
 accumulates beneath it.
 
-The size figures are the point of it: they let a caller see what a `get_brief`
-or `get_value` would cost *before* paying it, so "is there anything relevant
+The size figures are the point of it: they let a caller see what a `get_context`
+would cost *before* paying it, so "is there anything relevant
 here" stops being a question that costs thousands of tokens to ask. Superseded
 archives are excluded from the counts — they are recoverable history, not part
 of what the store currently knows, and including them would make every edited

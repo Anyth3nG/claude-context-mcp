@@ -31,8 +31,7 @@ from mcp_server.auth import REASON_NO_TOKEN, log_auth_rejection, verifier_from_e
 from mcp_server.map_routes import register_map_routes
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
 from mcp_server.tools.get_index import DESCRIPTION as GET_INDEX_DESCRIPTION, get_index
-from mcp_server.tools.get_brief import DESCRIPTION as GET_BRIEF_DESCRIPTION, get_brief
-from mcp_server.tools.get_value import DESCRIPTION as GET_VALUE_DESCRIPTION, get_value
+from mcp_server.tools.get_context import DESCRIPTION as GET_CONTEXT_DESCRIPTION, get_context
 from mcp_server.tools.get_history import DESCRIPTION as GET_HISTORY_DESCRIPTION, get_history
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
 from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
@@ -98,7 +97,7 @@ OAUTH_ENABLED = _token_verifier is not None
 # Every session pays for this, so it stays short.
 INSTRUCTIONS = """Durable memory for this user, shared across every machine and both clients (Claude Code and claude.ai). Context saved in another session is available in this one — do NOT assume it is empty, and do not re-derive what may already be recorded.
 
-Open with get_index(detail="projects"): a table of contents for tens of tokens. Then go only as deep as the task needs — get_brief(project), get_brief(project, category) to narrow it, get_value for one slot, get_history for how a slot changed, search_context when you don't know where to look.
+Open with get_index(detail="projects"): a table of contents for tens of tokens. Then go only as deep as the task needs — get_context(project), narrowed by category and then key, get_history for how a slot changed, search_context when you don't know where to look.
 
 Write sparingly: patch_context revises a fact that already has a value, add_update appends a new one. Decisions worth having later, not conversation."""
 
@@ -110,12 +109,12 @@ mcp = MCPServer(
 )
 # Read side, cheapest first — which is also the order they should be reached
 # for. get_index is a map with no contents and is what a session should open
-# with; get_brief/get_value are deterministic lookups returning whole documents;
-# search_context ranks and truncates, so it's for history only.
+# with; get_context is the deterministic lookup returning whole documents, at
+# whatever depth the address it is given implies; search_context ranks and
+# truncates, so it's for history only.
 mcp.add_tool(get_index, description=GET_INDEX_DESCRIPTION)
-mcp.add_tool(get_brief, description=GET_BRIEF_DESCRIPTION)
-mcp.add_tool(get_value, description=GET_VALUE_DESCRIPTION)
-# Between get_value and search_context by design: it answers "how did this
+mcp.add_tool(get_context, description=GET_CONTEXT_DESCRIPTION)
+# Between get_context and search_context by design: it answers "how did this
 # known slot change" deterministically, which is the question people reach for
 # search_context to answer and get ranking and truncation instead. Search stays
 # the tool for when you do NOT know where to look.

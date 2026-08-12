@@ -1249,7 +1249,7 @@ class ContextStore:
                 "projects": toc,
                 "total_summaries": len(summaries["ids"]),
                 "total_history_chunks": len(chunks["ids"]),
-                "next": "get_brief(project) for one project's current state, "
+                "next": "get_context(project) for one project's current state, "
                         "or get_index(project=...) for its individual slots.",
             }
 
