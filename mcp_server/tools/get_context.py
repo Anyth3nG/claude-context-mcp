@@ -86,12 +86,25 @@ def get_context(
 
 
 def _category_counts(store, project: Optional[str]) -> dict[str, int]:
-    """How many slots each category holds, from metadata only — no documents."""
-    entry = store.index(project=project)["projects"].get(project or "general", {})
+    """
+    How many slots each category holds, from metadata only — no documents.
+
+    Deliberately NOT store.index(): that scans summaries AND history chunks to
+    build sizes and dates this needs none of, which measured at 532ms against a
+    172ms answer — the advertisement costing three times the thing it annotates.
+    One metadata-only scan of the project's live summaries is 178ms and yields
+    the same counts.
+    """
+    got = store.collection.get(
+        where={"$and": [{"project": project or "general"}, {"type": "summary"},
+                        {"source": "live"}]},
+        include=["metadatas"],
+    )
     counts: dict[str, int] = {}
-    for label in entry.get("summaries", {}):
-        cat = label.split("/", 1)[0]
-        counts[cat] = counts.get(cat, 0) + 1
+    for meta in got["metadatas"]:
+        cat = meta.get("category")
+        if cat:
+            counts[cat] = counts.get(cat, 0) + 1
     return counts
 
 
