@@ -40,23 +40,41 @@ MAX_DOC_CHARS = 800
 # How close a typo must be to auto-correct (0-1, difflib ratio).
 CATEGORY_MATCH_CUTOFF = 0.75
 
-# Marks a summary that has been replaced. Archived copies keep the full text but
-# are excluded from search by default — otherwise every superseded fact stays
-# semantically searchable forever and "what do we use for vectors?" starts
-# returning last month's answer alongside this month's.
+# Marks a summary that has been replaced. Archived copies keep the full text and,
+# since 2026-08-16, are VISIBLE in ordinary search alongside any other chunk —
+# they are history, and history is what the chunk tier is for. The provenance is
+# still recorded (superseded_from names the slot it came from); it just no longer
+# gates visibility.
 SUPERSEDED_SOURCE = "superseded"
 
-# Marks a chunk that turned out to be WRONG, as opposed to merely old. Kept
-# separate from SUPERSEDED_SOURCE on purpose: a superseded summary is an earlier
-# version that was true when written, so include_superseded=True is a reasonable
-# way to ask "what did this used to say?". A retired chunk is a fact later shown
-# to be incorrect, and pulling it back under that same flag would hand a caller
-# known-wrong material while it believes it asked for history. Both are hidden
-# from search by default; only retirement carries a reason.
+# Marks a chunk that turned out to be WRONG, as opposed to merely old. This is
+# the ONLY source hidden from search by default, and the distinction is the
+# reason: a superseded summary was true when written and remains valid history,
+# while a retired chunk is a fact later shown to be incorrect. Handing the second
+# back to a caller asking about the past would be answering with known-wrong
+# material.
 RETIRED_SOURCE = "retired"
 
-# Sources hidden from search unless a caller opts back in.
-HIDDEN_SOURCES = (SUPERSEDED_SOURCE, RETIRED_SOURCE)
+# Hidden from search unless a caller opts back in. Narrowed from
+# (superseded, retired) on 2026-08-16 — see below for why hiding both was wrong.
+#
+# Hiding them identically contradicted the store's own distinction between them,
+# and it never achieved what it was for. The goal was to keep current-state
+# questions free of contradiction, but a LIVE chunk that quietly goes stale (one
+# that was never part of a summary, so never formally superseded) stayed fully
+# visible forever — so the protection was never consistent. Worst case was
+# archive_slot's "nothing replaces this": the only content that ever existed on a
+# topic went invisible by default, a false negative strictly worse than the
+# contradiction risk being guarded against.
+SEARCH_HIDDEN_SOURCES = (RETIRED_SOURCE,)
+
+# What index() leaves out of its history_chunks count — deliberately NOT the same
+# set as SEARCH_HIDDEN_SOURCES, though the two were one constant until 2026-08-16.
+# Search visibility and map arithmetic are different questions: the index already
+# reports archived material separately as prior_versions and archived_slots, so
+# counting superseded copies here as well would double-count them and make every
+# edited slot look like the project had grown.
+INDEX_EXCLUDED_SOURCES = (SUPERSEDED_SOURCE, RETIRED_SOURCE)
 
 # A replacement shorter than this fraction of the current summary is refused.
 # Catches the characteristic failure of overwrite-in-place: a caller that read a
@@ -294,7 +312,10 @@ def _normalize_key(key: Optional[str]) -> Optional[str]:
             "Keys name a topic ('cognito', 'deploy'); they are not descriptions."
         )
     if slug == "summary":
-        # Would collide with the unkeyed id f"{project}-{category}-summary".
+        # Under the old SUFFIX id form this genuinely collided with the unkeyed
+        # id f"{project}-{category}-summary". The prefix form no longer collides,
+        # but the reservation stays: a slot addressed as summary-{p}-{c}-summary
+        # reads as a formatting mistake, and "summary" names no topic anyway.
         raise ValueError("'summary' is reserved and cannot be used as a key.")
     return slug
 
@@ -525,7 +546,7 @@ class ContextStore:
         # project+category — deterministic id, always overwritten. Chunks
         # accumulate as a raw fallback layer and are never edited in place.
         if type == "summary":
-            id = f"{project_key}-{category}-summary"
+            id = self.summary_id(project, category)
         else:
             id = self.chunk_id(document, project_key, category)
 
@@ -550,14 +571,26 @@ class ContextStore:
         """
         The deterministic slot id — one living document per project+category(+key).
 
-        `key` is OPTIONAL by design, and its absence reproduces the original id
-        byte for byte. That is what makes sub-keys a purely additive change: every
-        slot written before they existed keeps working untouched, and a bloated
-        category can be split lazily, when someone next has reason to touch it,
-        rather than in one migration pass.
+        PREFIX-based: `summary-{project}-{category}` or, keyed,
+        `summary-{project}-{category}-{key}`. Chunk ids already announce their
+        type from the first token — `chunk-<hash>`, `superseded-<hash>` — and
+        this used to be the one exception, a SUFFIX form requiring an
+        "ends with -summary" check instead of the "starts with X-" rule used
+        everywhere else. That asymmetry surfaced concretely while designing a
+        merged archive()/retire tool (tasks/tool-surface): target-type dispatch
+        had to special-case the suffix form. This makes id-based dispatch
+        uniform across all three types.
+
+        UNLIKE sub-keys, this is NOT byte-compatible with what came before —
+        every existing summary id changes shape, keyed or not. That is why it
+        shipped with a one-time rename migration (scripts/summary_id_prefix.py)
+        rather than the lazy, additive rollout sub-keys got: an old-format id
+        left unmigrated would silently stop matching this function's output,
+        and the next update_summary/patch_summary against it would create a
+        SECOND, duplicate live document instead of updating the original.
         """
         base = f"{project or 'general'}-{category}"
-        return f"{base}-{key}-summary" if key else f"{base}-summary"
+        return f"summary-{base}-{key}" if key else f"summary-{base}"
 
     def summary_keys(self, project: Optional[str], category: str) -> list[Optional[str]]:
         """
@@ -611,10 +644,12 @@ class ContextStore:
         # Anything the query didn't return still belongs in the list, just last.
         return ranked + [k for k in existing if k not in ranked]
 
-    def chunk_id(self, document: str, project_key: str, category: str) -> str:
+    def chunk_id(
+        self, document: str, project_key: str, category: str, key: Optional[str] = None
+    ) -> str:
         """
-        Content-addressed chunk id: same text, same project, same category ->
-        same id, forever.
+        Content-addressed chunk id: same text, same project, same category, same
+        key -> same id, forever.
 
         This used to mix datetime.now().timestamp() into the hash, which made
         every write unique — and therefore made a re-run after a partial failure
@@ -623,12 +658,17 @@ class ContextStore:
         not the exceptional one.
 
         The trade-off is deliberate: writing genuinely identical text twice into
-        the same project+category now collapses to one entry rather than two.
+        the same project+category+key now collapses to one entry rather than two.
         That is the correct reading — a chunk carries no position or ordering,
         so a byte-identical duplicate holds no information the first one didn't,
         and its only effect on retrieval is to occupy a second slot in top_k.
+
+        `key` is OPTIONAL, same reasoning as summary_id: its absence reproduces
+        the original id byte for byte, so widening the hash to include it is
+        additive rather than a migration. The same text filed under two
+        different keys now gets two distinct ids instead of colliding into one.
         """
-        raw = f"{project_key}-{category}-{document}"
+        raw = f"{project_key}-{category}-{key}-{document}" if key else f"{project_key}-{category}-{document}"
         return f"chunk-{hashlib.sha1(raw.encode()).hexdigest()[:16]}"
 
     def save_chunks(
@@ -640,6 +680,7 @@ class ContextStore:
         source: str = "live",
         chat_title: Optional[str] = None,
         timestamp: Optional[str] = None,
+        key: Optional[str] = None,
     ) -> dict:
         """
         Write several chunks in ONE upsert, and therefore one embedding call.
@@ -660,9 +701,19 @@ class ContextStore:
         splitting an old entry into retrieval-sized pieces must not make those
         pieces look like they were learned today. Live writes leave it unset and
         get the current time.
+
+        `key` is OPTIONAL and, unlike a summary key, ungated: it does not need
+        to match an existing summary slot, and there is no UnknownSummaryKey-style
+        refusal for coining a new one. Chunks are high-volume and low-commitment
+        by design — filing one under a key that doesn't have a summary yet is
+        valid, raw material waiting to possibly be promoted later. It only
+        widens chunk_id()'s hash so the same text under two keys doesn't
+        collapse into one entry; a pile of chunks under a key is never current
+        state on its own, only a summary is.
         """
         category, corrected_from = _normalize_category(category)
         project_key = project or "general"
+        key = _normalize_key(key)
         if not project:
             tier = None
         elif tier and tier not in VALID_TIERS:
@@ -687,12 +738,14 @@ class ContextStore:
             metadata["chat_title"] = chat_title
         if corrected_from:
             metadata["category_corrected_from"] = corrected_from
+        if key:
+            metadata["key"] = key
 
         # Deduplicate before the upsert rather than relying on Chroma to
         # tolerate a repeated id inside one batch.
         by_id: dict[str, str] = {}
         for doc in cleaned:
-            by_id.setdefault(self.chunk_id(doc, project_key, category), doc)
+            by_id.setdefault(self.chunk_id(doc, project_key, category, key), doc)
 
         ids = list(by_id)
         docs = [by_id[i] for i in ids]
@@ -821,7 +874,7 @@ class ContextStore:
                 "superseded_at": meta.get("superseded_at"),
                 "written_at": meta.get("timestamp"),
                 "chars": len(doc),
-                "reason": meta.get("archived_reason") or meta.get("superseded_reason"),
+                "reason": meta.get("archived_reason"),
             }
             for vid, doc, meta in zip(got["ids"], got["documents"], got["metadatas"])
         ]
@@ -900,8 +953,8 @@ class ContextStore:
         The archived copy is a superseded chunk, not a retired one, and that
         distinction is the point. Retired means wrong. Superseded means it was
         true when written and still is as history — which is exactly what a
-        finished phase is, and why include_superseded=True is the right way to
-        pull one back for comparison.
+        finished phase is, and why the copy stays visible in ordinary search
+        rather than being hidden behind an opt-in flag.
 
         Reuses _archive(), so the existing vector is carried over and this costs
         no Voyage call at all. The delete only removes the live pointer; the text
@@ -976,7 +1029,9 @@ class ContextStore:
                 "retired": False,
                 "already_retired": True,
                 "id": chunk_id,
-                "reason": meta.get("retired_reason"),
+                # archived_reason is current; retired_reason is a fallback for
+                # chunks retired before the reason fields collapsed into one.
+                "reason": meta.get("archived_reason") or meta.get("retired_reason"),
                 "retired_at": meta.get("retired_at"),
             }
 
@@ -984,7 +1039,7 @@ class ContextStore:
         meta.update(
             {
                 "source": RETIRED_SOURCE,
-                "retired_reason": reason.strip(),
+                "archived_reason": reason.strip(),
                 "retired_at": datetime.now(timezone.utc).isoformat(),
                 "retired_from_source": previous_source,
             }
@@ -1132,7 +1187,8 @@ class ContextStore:
         if detail not in ("slots", "projects"):
             raise ValueError(f"detail must be 'slots' or 'projects', got '{detail}'")
         summary_where: dict = {"type": "summary"}
-        chunk_clauses: list[dict] = [{"type": "chunk"}, {"source": {"$nin": list(HIDDEN_SOURCES)}}]
+        chunk_clauses: list[dict] = [{"type": "chunk"},
+                                     {"source": {"$nin": list(INDEX_EXCLUDED_SOURCES)}}]
         if project:
             summary_where = {"$and": [summary_where, {"project": project}]}
             chunk_clauses.append({"project": project})
@@ -1360,9 +1416,18 @@ class ContextStore:
         project: Optional[str] = None,  # None = search across all (incl. general)
         category: Optional[str] = None,
         top_k: int = DEFAULT_TOP_K,
-        include_superseded: bool = False,
         include_retired: bool = False,
     ):
+        """
+        Ranked similarity search over summaries and history.
+
+        ONE exclusion, not two. Superseded copies used to be hidden alongside
+        retired ones behind a separate include_superseded flag; since 2026-08-16
+        they are ordinary history and rank like any other chunk — see
+        SEARCH_HIDDEN_SOURCES for why hiding them was both inconsistent and, in
+        the archive_slot case, actively harmful. Only material the store has been
+        TOLD is wrong stays out by default.
+        """
         corrected_from = None
         if category is not None:
             category, corrected_from = _normalize_category(category)
@@ -1373,21 +1438,8 @@ class ContextStore:
             where_clauses.append({"project": project})
         if category:
             where_clauses.append({"category": category})
-        # Two separate exclusions, deliberately not one flag. Without the first,
-        # archived summaries compete with live ones and stale facts resurface as
-        # if current; history stays retrievable, but only when asked for. The
-        # second hides chunks retired as WRONG — and asking for old versions of a
-        # summary must not drag those back in, which is exactly what would happen
-        # if retirement reused the superseded flag.
-        hidden = []
-        if not include_superseded:
-            hidden.append(SUPERSEDED_SOURCE)
         if not include_retired:
-            hidden.append(RETIRED_SOURCE)
-        if len(hidden) == 1:
-            where_clauses.append({"source": {"$ne": hidden[0]}})
-        elif hidden:
-            where_clauses.append({"source": {"$nin": hidden}})
+            where_clauses.append({"source": {"$ne": RETIRED_SOURCE}})
 
         where = None
         if len(where_clauses) == 1:
@@ -1599,6 +1651,21 @@ if __name__ == "__main__":
     assert first["ids"] == second["ids"], "chunk id was not stable for identical content"
     assert added == 1, f"expected 1 new entry, got {added}"
 
+    print("\n=== Chunk keys: same text under different keys does NOT collapse ===")
+    assert store.chunk_id("x", "p", "cat") == f"chunk-{hashlib.sha1('p-cat-x'.encode()).hexdigest()[:16]}", \
+        "an unkeyed chunk id must reproduce the pre-key formula byte for byte"
+    unkeyed = store.save_chunks(["Rotation needs a republish."], category="note", project="keychunks", tier="personal")
+    keyed_a = store.save_chunks(["Rotation needs a republish."], category="note", project="keychunks", tier="personal", key="alpha")
+    keyed_b = store.save_chunks(["Rotation needs a republish."], category="note", project="keychunks", tier="personal", key="bravo")
+    same_key_again = store.save_chunks(["Rotation needs a republish."], category="note", project="keychunks", tier="personal", key="alpha")
+    ids = {unkeyed["ids"][0], keyed_a["ids"][0], keyed_b["ids"][0]}
+    print(f"  unkeyed={unkeyed['ids'][0]} alpha={keyed_a['ids'][0]} bravo={keyed_b['ids'][0]}")
+    assert len(ids) == 3, "identical text under three different keys (incl. no key) must get three distinct ids"
+    assert keyed_a["ids"] == same_key_again["ids"], "same text under the same key must still be stable"
+    stored_meta = store.collection.get(ids=[keyed_a["ids"][0]], include=["metadatas"])["metadatas"][0]
+    assert stored_meta["key"] == "alpha", "chunk metadata must carry its key"
+    print("  OK, keyed chunks get distinct, stable ids and carry key in metadata.")
+
     print("\n=== save_chunks: batch write, in-batch dedupe, oversized warning ===")
     batch = store.save_chunks(
         ["Fact one.", "Fact two.", "Fact one.", "x" * (MAX_DOC_CHARS + 100)],
@@ -1692,12 +1759,12 @@ if __name__ == "__main__":
     print(f"touched {len('alpha')}/{len('alpha beta gamma delta')} chars, archived={res['archived_id']}")
     assert res["archived_id"] is not None, "a patch over the ratio should archive"
 
-    print("\n=== Archived copies stay out of ordinary search ===")
-    r = store.search("alpha beta gamma", project="patch-test")
-    assert all("omega" in d or "alpha beta gamma delta" not in d for d in r["documents"][0])
-    r = store.search("alpha beta gamma", project="patch-test", include_superseded=True)
-    assert any("alpha beta gamma delta" == d for d in r["documents"][0]), "archive not retrievable"
-    print("OK, superseded copies excluded by default and reachable on request.")
+    print("\n=== Archived copies are ordinary, visible history ===")
+    r = store.search("alpha beta gamma", project="patch-test", top_k=10)
+    assert any("alpha beta gamma delta" == d for d in r["documents"][0]), \
+        "a superseded copy must rank in DEFAULT search — it is history, not error"
+    assert any("omega" in d for d in r["documents"][0]), "the live value must still be there too"
+    print("OK, superseded copies rank alongside the current value, no flag needed.")
 
     print("\n=== index(): the map, without the contents ===")
     idx = store.index()
@@ -1733,16 +1800,27 @@ if __name__ == "__main__":
     assert idx["projects"]["patch-test"]["history_chunks"] == 0, "archives leaked into the index"
     print(f"OK, {len(archived['ids'])} archived copies present and none counted as history.")
 
+    # Search visibility and index arithmetic are deliberately DIFFERENT sets.
+    # Superseded copies became ordinary search results on 2026-08-16, but the
+    # index still leaves them out of history_chunks because it reports them
+    # separately as prior_versions — counting both would double-count.
+    assert SUPERSEDED_SOURCE in INDEX_EXCLUDED_SOURCES
+    assert SUPERSEDED_SOURCE not in SEARCH_HIDDEN_SOURCES
+    visible = store.search("alpha beta gamma", project="patch-test", top_k=10)["ids"][0]
+    assert any(i in visible for i in archived["ids"]), \
+        "the same copies the index excludes must still be searchable"
+    print("  and the same copies ARE searchable — the two exclusions are separate on purpose.")
+
     print("\n=== index(project=...) scopes, and an unknown project is empty not an error ===")
     scoped = store.index(project="patch-test")
     assert list(scoped["projects"]) == ["patch-test"]
     assert store.index(project="no-such-project")["projects"] == {}
     print("OK, scoping and empty results behave.")
 
-    print("\n=== Sub-keys: an unkeyed slot keeps its original id, byte for byte ===")
-    assert store.summary_id("p", "config") == "p-config-summary"
-    assert store.summary_id("p", "config", "lambda") == "p-config-lambda-summary"
-    print("OK, adding keys is additive — existing slots need no migration.")
+    print("\n=== Summary ids: prefix-based, keyed extends unkeyed ===")
+    assert store.summary_id("p", "config") == "summary-p-config"
+    assert store.summary_id("p", "config", "lambda") == "summary-p-config-lambda"
+    print("OK, summary- prefix on both forms, keyed just appends -{key}.")
 
     print("\n=== Key slugification ===")
     for raw, want in [("Lambda Settings", "lambda-settings"), ("lambda_settings", "lambda-settings"),
@@ -1814,7 +1892,7 @@ if __name__ == "__main__":
         old_str="two app clients", new_str="three app clients",
         category="config", project="keytest", key="cognito",
     )
-    assert res["id"] == "keytest-config-cognito-summary"
+    assert res["id"] == "summary-keytest-config-cognito"
     assert "three app clients" in store.get_summary("keytest", "config", key="cognito")[0]
     assert "Lambda" in store.get_summary("keytest", "config", key="lambda")[0], \
         "patching one key must leave its siblings alone"
@@ -1915,6 +1993,17 @@ if __name__ == "__main__":
     assert store.slot_history("hist", "config", "rotation")["version_count"] == 3, \
         "archiving adds the live value as a third version"
 
+    # A superseded chunk (from _archive) must carry the key of the summary it
+    # came from — it's redundant with superseded_from but keeps both queryable
+    # on the same field instead of needing per-origin parsing logic.
+    rotation_versions = store.collection.get(
+        where={"superseded_from": store.summary_id("hist", "config", "rotation")},
+        include=["metadatas"],
+    )["metadatas"]
+    assert all(m.get("key") == "rotation" for m in rotation_versions), \
+        "every superseded copy of a keyed slot must carry that key in its metadata"
+    print("  superseded copies of a keyed slot carry that key too.")
+
     print("\n=== archive_slot: finished work leaves the brief but stays retrievable ===")
     store.update_summary("PHASE X - do the thing. DONE, shipped as abc1234.",
                          category="tasks", project="archtest", tier="personal", key="phase-x")
@@ -1934,16 +2023,20 @@ if __name__ == "__main__":
         "archived slot must leave get_brief — that is the whole point"
     print(f"  gone from brief and index, freed {arch['chars_freed']} chars; sibling untouched.")
 
-    # Archived as SUPERSEDED, not RETIRED: it was true when written.
-    back = store.search(query="phase X do the thing", project="archtest",
-                        top_k=10, include_superseded=True)
-    assert arch["archived_id"] in back["ids"][0], "include_superseded must bring it back"
-    gone = store.search(query="phase X do the thing", project="archtest", top_k=10)
-    assert arch["archived_id"] not in gone["ids"][0], "default search must not surface it"
+    # Archived as SUPERSEDED, not RETIRED: it was true when written. And this is
+    # the case that drove the visibility collapse — archive_slot leaves NOTHING
+    # behind, so if the archived copy were hidden, the only content that ever
+    # existed on this topic would be undiscoverable by default. A search finding
+    # nothing is a worse failure than a search finding an old answer.
+    back = store.search(query="phase X do the thing", project="archtest", top_k=10)
+    assert arch["archived_id"] in back["ids"][0], \
+        "an archived-outright slot must be findable in DEFAULT search, or it is lost"
     amet = store.collection.get(ids=[arch["archived_id"]], include=["metadatas"])["metadatas"][0]
     assert amet["source"] == SUPERSEDED_SOURCE, "finished is superseded, not retired"
     assert amet["archived_reason"].startswith("Completed")
-    print("  recoverable via include_superseded, flagged superseded not retired.")
+    assert amet["superseded_from"] == store.summary_id("archtest", "tasks", "phase-x"), \
+        "provenance must survive — it stopped gating visibility, it did not go away"
+    print("  findable by default, provenance intact, flagged superseded not retired.")
 
     try:
         store.archive_slot(project="archtest", category="tasks", key="never-existed")
@@ -1975,16 +2068,16 @@ if __name__ == "__main__":
     assert other in _visible(), "retiring one chunk must not affect its neighbours"
     print("  hidden from search, neighbour untouched.")
 
-    # The whole reason retirement has its own source value: asking for old
-    # versions of a summary must not hand back facts known to be wrong.
-    assert wrong not in _visible(include_superseded=True), \
-        "include_superseded must NOT resurface retired chunks — that is why RETIRED_SOURCE is separate"
+    # Retirement is now the ONLY exclusion, which makes it the load-bearing one:
+    # superseded history flows through default search freely, so nothing but
+    # include_retired can bring back material known to be wrong.
     assert wrong in _visible(include_retired=True), "include_retired should surface it for auditing"
-    print("  include_superseded does not resurface it; include_retired does.")
+    print("  only include_retired brings it back.")
 
     meta = store.collection.get(ids=[wrong], include=["metadatas"])["metadatas"][0]
     assert meta["source"] == RETIRED_SOURCE and meta["superseded_by"] == "config/rotation"
-    assert meta["retired_reason"].startswith("SnapStart")
+    assert meta["archived_reason"].startswith("SnapStart")
+    assert "retired_reason" not in meta, "retire_chunk must write the unified archived_reason field, not the old one"
     assert store.retire_chunk(wrong, reason="again")["already_retired"] is True
     assert store.index(project="retiretest")["projects"]["retiretest"]["history_chunks"] == 1, \
         "retired chunks must not be counted as live history"

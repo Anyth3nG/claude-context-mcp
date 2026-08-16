@@ -88,11 +88,20 @@ so lists fail on reads against Cloud while working fine locally.
 
 ## Write semantics
 
-- **Summaries upsert** on a deterministic id: `f"{project}-{category}-summary"`
-  (or `f"general-{category}-summary"` when there's no project). Writing a new
+- **Summaries upsert** on a deterministic id: `f"summary-{project}-{category}"`
+  (or `f"summary-general-{category}"` when there's no project). Writing a new
   summary for the same project+category REPLACES the old one — there is only
   ever one living summary per slot. Enforced in `ContextStore.save()`, not
   left to callers to get right.
+
+  This id is **prefix-based**, matching `chunk-<hash>` and `superseded-<hash>`
+  so every id in the store announces its type from the first token. It was a
+  suffix (`f"{project}-{category}-summary"`) until 2026-08-16; the change forced
+  a one-time rename of all 102 slots plus the 87 `superseded_from` pointers that
+  referenced them (`scripts/summary_id_prefix.py`), because unlike sub-keys it is
+  **not** byte-compatible — an unmigrated slot stops matching `summary_id()` and
+  the next write against it creates a duplicate live document rather than
+  updating the original.
 - **Chunks insert** under a **content-addressed** id:
   `sha1(f"{project}-{category}-{document}")`. Same text in the same
   project+category is the same entry, always. This id previously mixed in
@@ -103,14 +112,26 @@ so lists fail on reads against Cloud while working fine locally.
   now collapses to one entry. A chunk carries no position or ordering, so a
   duplicate holds no information the first copy didn't, and its only effect on
   retrieval is to occupy a second slot in `top_k`.
+- **Chunks may also carry an optional `key`**, the same one summary sub-keys
+  use, which widens the id hash to `sha1(f"{project}-{category}-{key}-{document}")`.
+  Omitting it reproduces the original id byte for byte, so this is additive
+  the same way summary sub-keys are. Unlike a summary key, a chunk key is
+  never gated — no `create_key` check, and it does not need a matching
+  summary slot to exist. Filing a chunk under a key with no summary yet is
+  valid: raw material waiting to possibly be promoted later, not an error. A
+  superseded chunk (one archived from a summary slot via `_archive()`)
+  inherits its key automatically, since it's built from that slot's own
+  metadata.
 
 ### Sub-keys: one slot per topic, not per category
 
 A summary slot may carry an optional `key`, making its id
-`f"{project}-{category}-{key}-summary"`. **Omitting the key reproduces the
-original id byte for byte**, which is what makes this additive: slots written
+`f"summary-{project}-{category}-{key}"`. **Omitting the key reproduces the
+unkeyed id byte for byte**, which is what makes this additive: slots written
 before keys existed keep working untouched, and a bloated category is split when
-someone next has reason to touch it rather than in a migration.
+someone next has reason to touch it rather than in a migration. (That property is
+about the `key` alone — the `summary-` prefix arrived later and did need a
+migration, as noted above.)
 
 The motivation is retrieval, not write cost — `patch_summary` already solved the
 write side. Search truncates at 800 characters, so before splitting, the five
@@ -205,6 +226,39 @@ things that were in tension: typos are the expected common case (not
 malicious or ambiguous), but a silent correction would just relocate the
 original problem — an entry filed under a category the caller didn't
 realize was substituted.
+
+### Two tiers, not three: summaries are current, everything else is history
+
+A `summary` is the live tier — the only thing that answers "what is true now".
+Everything else is one uniform history tier: chunks appended through
+`add_update`, and ex-summaries archived from a slot, are the same kind of thing
+and rank together in search.
+
+That was three tiers until 2026-08-16, with `source: "superseded"` hidden from
+search behind an `include_superseded` flag. Hiding it was wrong on its own terms:
+
+- It contradicted the store's own distinction. `superseded` means "was true when
+  written", `retired` means "wrong" — hiding both identically erased the reason
+  the two values exist.
+- It never worked consistently. A live chunk that quietly goes stale was never
+  formally superseded (it was never part of a summary), so it stayed visible
+  forever. The "protect current-state answers from contradiction" goal was only
+  ever enforced against the subset that happened to pass through a summary slot.
+- Its worst case was a false negative. `archive_slot` leaves nothing behind, so
+  for a topic whose only slot was archived, the sole content that ever existed
+  became undiscoverable — strictly worse than surfacing an old answer with its
+  provenance attached.
+
+**`retired` is now the only source excluded by default** (`SEARCH_HIDDEN_SOURCES`),
+reachable with `include_retired=True` for auditing. `superseded_from` survives as
+provenance — it says which slot a copy came from, it just no longer gates
+visibility.
+
+One deliberate asymmetry: `index()` still excludes superseded copies from its
+`history_chunks` count (`INDEX_EXCLUDED_SOURCES`). Search visibility and map
+arithmetic are different questions — the index reports archived material
+separately as `prior_versions` and `archived_slots`, so counting it as history
+too would double-count it and make every edited slot look like growth.
 
 ## Reading: index first, then narrow
 
