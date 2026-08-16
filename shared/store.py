@@ -1224,7 +1224,19 @@ class ContextStore:
         # Two independent triggers: this patch is large enough to approach a
         # rewrite, or enough small ones have accumulated since the last copy
         # that the document may have drifted substantially anyway.
-        touched = len(old_str) / len(previous_doc) if previous_doc else 1.0
+        #
+        # max(old, new), not len(old_str) alone. The ratio originally measured
+        # only how much text was DISPLACED, which is blind to the shape of edit
+        # that causes the most drift: an append, where a short old_str is swapped
+        # for a much longer new_str. Measured live, three slots grew 45-145% in a
+        # single session and archived nothing, because each edit displaced under
+        # 20% while adding multiples of it — and get_history then reported they
+        # had "only ever been patched in small pieces", which was untrue. A patch
+        # that injects far more than it removes rewrites the document just as
+        # thoroughly as one that replaces a long passage.
+        touched = (
+            max(len(old_str), len(new_str)) / len(previous_doc) if previous_doc else 1.0
+        )
         unarchived = int(previous_meta.get("unarchived_patches") or 0)
         archive_now = touched >= PATCH_ARCHIVE_RATIO or (unarchived + 1) >= PATCH_ARCHIVE_EVERY
 
@@ -1878,6 +1890,30 @@ if __name__ == "__main__":
     )
     print(f"touched {len('alpha')}/{len('alpha beta gamma delta')} chars, archived={res['archived_id']}")
     assert res["archived_id"] is not None, "a patch over the ratio should archive"
+
+    print("\n=== patch_summary: an APPEND-shaped patch archives too ===")
+    # The regression this guards: the ratio used to measure only len(old_str),
+    # so swapping a short marker for a large block displaced almost nothing
+    # while growing the document by half — and archived nothing. Live slots grew
+    # 45-145% in one session with zero checkpoints before this was fixed.
+    base = "HEADER. " + "Body text that makes this document a realistic length. " * 20
+    store.save(document=base, category="tasks", type="summary",
+               project="append-test", tier="personal", source="live")
+    injected = "MASSIVE NEW SECTION. " + "Freshly appended detail. " * 30
+    res = store.patch_summary(
+        old_str="HEADER.", new_str=f"HEADER.\n\n{injected}",
+        category="tasks", project="append-test",
+    )
+    displaced = len("HEADER.") / len(base)
+    print(f"  displaced {displaced:.1%} of the document but grew it "
+          f"{res['chars_before']} -> {res['chars_after']} ({res['delta']:+d}); "
+          f"archived={res['archived_id'] is not None}")
+    assert displaced < PATCH_ARCHIVE_RATIO, "fixture must displace less than the ratio"
+    assert res["archived_id"] is not None, \
+        "an append that injects more than the ratio must archive — growth is drift too"
+    assert store.slot_history("append-test", "tasks")["versions"][0]["content"] == base, \
+        "the checkpoint must hold the pre-append text"
+    print("  checkpoint holds the pre-append version.")
 
     print("\n=== Archived copies are ordinary, visible history ===")
     r = store.search("alpha beta gamma", project="patch-test", top_k=10)
