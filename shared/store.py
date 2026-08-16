@@ -35,7 +35,23 @@ VALID_TIERS = {"client", "personal"}
 # unbounded tokens into the conversation.
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 10
-MAX_DOC_CHARS = 800
+
+# Where search_context clips a document. Raised from 800 on 2026-08-16, when
+# archived summaries became ordinary search results (see SEARCH_HIDDEN_SOURCES).
+# 800 was calibrated against the old population of hits — short, disciplined,
+# single-fact chunks, which is what add_update's own guidance asks for. Ex-summaries
+# are a different shape entirely, and 800 clipped them far harder than it ever
+# clipped what it was tuned for.
+MAX_DOC_CHARS = 1000
+
+# The no-split buffer from decisions/chunk-size-buffer, now enforced in code
+# rather than left to a caller's judgement. That decision set the policy for a
+# HUMAN deciding whether to split as they wrote: don't split to save a few
+# characters, because near-duplicate entries pollute retrieval worse than a
+# clipped trailing clause does. _archive() has no caller in the loop to make that
+# call, so the same tolerance has to be a number.
+SPLIT_BUFFER_RATIO = 1.10
+SPLIT_THRESHOLD = int(MAX_DOC_CHARS * SPLIT_BUFFER_RATIO)
 
 # How close a typo must be to auto-correct (0-1, difflib ratio).
 CATEGORY_MATCH_CUTOFF = 0.75
@@ -318,6 +334,46 @@ def _normalize_key(key: Optional[str]) -> Optional[str]:
         # reads as a formatting mistake, and "summary" names no topic anyway.
         raise ValueError("'summary' is reserved and cannot be used as a key.")
     return slug
+
+
+def _split_for_archive(document: str) -> list[str]:
+    """
+    Cut an oversized document into retrieval-sized pieces at paragraph
+    boundaries. Returns [document] unchanged when it fits, which is the common
+    case and costs nothing.
+
+    MECHANICAL, NOT SEMANTIC, and that is the constraint that shapes it.
+    add_update can ask a caller "is this a second distinct fact?" because a
+    caller is present. _archive() runs automatically with nobody in the loop, so
+    this only uses a signal already in the text — the blank line the author
+    already put there — and never invents a boundary.
+
+    Paragraphs are packed GREEDILY rather than one per piece. One paragraph per
+    piece would shred a document of short paragraphs into a pile of fragments,
+    which is the near-duplicate problem decisions/chunk-size-buffer warns about
+    arriving by a different route.
+
+    A single paragraph longer than the threshold comes back whole. Splitting it
+    would mean cutting mid-sentence on a character count, and a piece that starts
+    partway through a clause is worse than one that gets clipped in display —
+    the clip is at least visible as a clip. Rare in practice, since the documents
+    this handles are archived summaries, which are written in paragraphs.
+    """
+    if len(document) <= SPLIT_THRESHOLD:
+        return [document]
+
+    pieces: list[str] = []
+    current = ""
+    for paragraph in document.split("\n\n"):
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if current and len(candidate) > SPLIT_THRESHOLD:
+            pieces.append(current)
+            current = paragraph
+        else:
+            current = candidate
+    if current:
+        pieces.append(current)
+    return pieces
 
 
 VOYAGE_EMBEDDINGS_URL = "https://api.voyageai.com/v1/embeddings"
@@ -796,7 +852,7 @@ class ContextStore:
         ranking, no top_k, no truncation.
 
         This exists because search() is the wrong instrument for "what is the
-        current state of X". Ranked search returns the first ~800 chars of the
+        current state of X". Ranked search returns the first ~1000 chars of the
         five best-matching documents, which for long entries means most of the
         content is unreachable no matter how the query is phrased. A brief is a
         deterministic id lookup, so it can hand back the complete text.
@@ -867,17 +923,42 @@ class ContextStore:
         got = self.collection.get(
             where={"superseded_from": sid}, include=["documents", "metadatas"]
         )
-        versions = [
-            {
-                "archived_id": vid,
-                "content": doc,
-                "superseded_at": meta.get("superseded_at"),
-                "written_at": meta.get("timestamp"),
-                "chars": len(doc),
-                "reason": meta.get("archived_reason"),
+        # An oversized version was archived as several pieces (see
+        # _split_for_archive), and one archival event is ONE version of the slot,
+        # not three. Group by superseded_at — every piece of a single _archive
+        # call carries the same stamp by construction — and stitch the pieces
+        # back in order, so history reads as a version chain rather than as a
+        # pile of fragments the caller has to reassemble.
+        by_event: dict[str, list] = {}
+        for vid, doc, meta in zip(got["ids"], got["documents"], got["metadatas"]):
+            by_event.setdefault(meta.get("superseded_at") or "", []).append((vid, doc, meta))
+
+        versions = []
+        for stamp, members in by_event.items():
+            members.sort(key=lambda m: m[2].get("split_index") or 0)
+            content = "\n\n".join(doc for _, doc, _ in members)
+            head_meta = members[0][2]
+            version = {
+                "archived_id": members[0][0],
+                "content": content,
+                "superseded_at": stamp or None,
+                "written_at": head_meta.get("timestamp"),
+                "chars": len(content),
+                "reason": head_meta.get("archived_reason"),
             }
-            for vid, doc, meta in zip(got["ids"], got["documents"], got["metadatas"])
-        ]
+            if len(members) > 1:
+                # Named only when it happened, so the ordinary case stays terse.
+                # A missing piece shows up here as a length mismatch rather than
+                # as text that quietly isn't there.
+                version["reassembled_from"] = [vid for vid, _, _ in members]
+                version["pieces"] = len(members)
+                expected = head_meta.get("split_count")
+                if expected and expected != len(members):
+                    version["incomplete"] = (
+                        f"expected {expected} pieces, found {len(members)} — "
+                        "this version is missing part of its text"
+                    )
+            versions.append(version)
         # Newest first: the most recent previous value is nearly always the one
         # being asked for, and reverse-chronological reads as a changelog.
         versions.sort(key=lambda v: v["superseded_at"] or "", reverse=True)
@@ -898,39 +979,65 @@ class ContextStore:
             "category_corrected_from": corrected_from,
         }
 
-    def _archive(self, sid: str, previous_doc: str, previous_meta: dict, previous_emb) -> str:
+    def _archive(self, sid: str, previous_doc: str, previous_meta: dict, previous_emb) -> list[str]:
         """
-        Stash a copy of a summary about to be changed, as a superseded chunk.
+        Stash a copy of a summary about to be changed, as superseded chunk(s).
 
-        Deterministic id from the content being archived, so re-running the same
+        Deterministic ids from the content being archived, so re-running the same
         replacement doesn't pile up duplicate copies of one old value.
 
-        Reuses the vector Chroma already holds: the text is unchanged, so its
-        embedding is still exactly right and archiving costs no Voyage call at
-        all. That is what makes a forced periodic archive (PATCH_ARCHIVE_EVERY)
-        cheap enough to do on a schedule rather than only when it looks needed.
+        Returns a LIST because an oversized document is split into
+        retrieval-sized pieces (see _split_for_archive). Nearly always one id;
+        callers that want a single handle should take the first.
+
+        COST, and the split changes it. Unsplit, this reuses the vector Chroma
+        already holds — the text is unchanged, so its embedding is still exactly
+        right and archiving costs no Voyage call at all. That is what makes a
+        forced periodic archive (PATCH_ARCHIVE_EVERY) cheap enough to run on a
+        schedule. Split, the pieces are new texts and the old vector no longer
+        describes any of them, so they must be embedded — but all of them go in
+        ONE upsert and therefore one Voyage call, however many pieces there are.
+        So the common case stays free and the rare case costs one call, not one
+        per piece.
         """
-        digest = hashlib.sha1(f"{sid}-{previous_doc}".encode()).hexdigest()[:16]
-        archived_id = f"superseded-{digest}"
+        pieces = _split_for_archive(previous_doc)
         archive_meta = {
             **previous_meta,
             "type": "chunk",
             "source": SUPERSEDED_SOURCE,
             "superseded_from": sid,
+            # One timestamp for the whole archival event, so the pieces of a
+            # single version share a group key that slot_history can gather on.
             "superseded_at": datetime.now(timezone.utc).isoformat(),
         }
         # A copy is a historical record, not a live slot — the live document's
         # patch counter says nothing about it and would only be confusing here.
         archive_meta.pop("unarchived_patches", None)
-        archive_kwargs = {
-            "ids": [archived_id],
-            "documents": [previous_doc],
-            "metadatas": [archive_meta],
-        }
-        if previous_emb is not None:
-            archive_kwargs["embeddings"] = [previous_emb]
-        self.collection.upsert(**archive_kwargs)
-        return archived_id
+
+        if len(pieces) == 1:
+            digest = hashlib.sha1(f"{sid}-{previous_doc}".encode()).hexdigest()[:16]
+            archive_kwargs = {
+                "ids": [f"superseded-{digest}"],
+                "documents": [previous_doc],
+                "metadatas": [archive_meta],
+            }
+            if previous_emb is not None:
+                archive_kwargs["embeddings"] = [previous_emb]
+            self.collection.upsert(**archive_kwargs)
+            return archive_kwargs["ids"]
+
+        ids, metas = [], []
+        for i, piece in enumerate(pieces):
+            # split_index is in the hash as well as the metadata: two pieces of
+            # one document could in principle carry identical text, and without
+            # it they would collapse onto one id and lose a piece silently.
+            digest = hashlib.sha1(f"{sid}-{i}-{piece}".encode()).hexdigest()[:16]
+            ids.append(f"superseded-{digest}")
+            metas.append({**archive_meta, "split_index": i, "split_count": len(pieces)})
+        # No embeddings passed: each piece is a new text and needs its own vector.
+        # One upsert, so Chroma issues one embed call for the whole batch.
+        self.collection.upsert(ids=ids, documents=pieces, metadatas=metas)
+        return ids
 
     def archive_slot(
         self,
@@ -957,8 +1064,9 @@ class ContextStore:
         rather than being hidden behind an opt-in flag.
 
         Reuses _archive(), so the existing vector is carried over and this costs
-        no Voyage call at all. The delete only removes the live pointer; the text
-        and its embedding survive in the archive.
+        no Voyage call at all — unless the slot is long enough to be split into
+        pieces, which costs exactly one. The delete only removes the live
+        pointer; the text survives in the archive.
         """
         sid = self.summary_id(project, category, key)
         current = self.get_summary(project, category, with_embedding=True, key=key)
@@ -969,7 +1077,7 @@ class ContextStore:
         archive_meta = dict(meta)
         if reason and reason.strip():
             archive_meta["archived_reason"] = reason.strip()
-        archived_id = self._archive(sid, doc, archive_meta, emb)
+        archived_ids = self._archive(sid, doc, archive_meta, emb)
         # Only now drop the live document. If _archive raised, the slot is still
         # intact — losing the copy and the original in one call is the failure
         # this ordering exists to prevent.
@@ -977,7 +1085,9 @@ class ContextStore:
         return {
             "archived": True,
             "id": sid,
-            "archived_id": archived_id,
+            "archived_id": archived_ids[0],
+            "archived_ids": archived_ids,
+            "split_into": len(archived_ids) if len(archived_ids) > 1 else None,
             "chars_freed": len(doc),
             "reason": reason.strip() or None,
             "project": project or "general",
@@ -1114,13 +1224,27 @@ class ContextStore:
         # Two independent triggers: this patch is large enough to approach a
         # rewrite, or enough small ones have accumulated since the last copy
         # that the document may have drifted substantially anyway.
-        touched = len(old_str) / len(previous_doc) if previous_doc else 1.0
+        #
+        # max(old, new), not len(old_str) alone. The ratio originally measured
+        # only how much text was DISPLACED, which is blind to the shape of edit
+        # that causes the most drift: an append, where a short old_str is swapped
+        # for a much longer new_str. Measured live, three slots grew 45-145% in a
+        # single session and archived nothing, because each edit displaced under
+        # 20% while adding multiples of it — and get_history then reported they
+        # had "only ever been patched in small pieces", which was untrue. A patch
+        # that injects far more than it removes rewrites the document just as
+        # thoroughly as one that replaces a long passage.
+        touched = (
+            max(len(old_str), len(new_str)) / len(previous_doc) if previous_doc else 1.0
+        )
         unarchived = int(previous_meta.get("unarchived_patches") or 0)
         archive_now = touched >= PATCH_ARCHIVE_RATIO or (unarchived + 1) >= PATCH_ARCHIVE_EVERY
 
         archived_id = None
+        archived_ids = None
         if archive_now:
-            archived_id = self._archive(sid, previous_doc, previous_meta, previous_emb)
+            archived_ids = self._archive(sid, previous_doc, previous_meta, previous_emb)
+            archived_id = archived_ids[0]
 
         # Rebuilt field by field rather than spread from previous_meta: tier and
         # chat_title are properties of the slot and must survive, but source and
@@ -1154,6 +1278,7 @@ class ContextStore:
             "chars_after": len(patched),
             "delta": len(patched) - len(previous_doc),
             "archived_id": archived_id,
+            "archived_split_into": len(archived_ids) if archived_ids and len(archived_ids) > 1 else None,
             "corrected_from": corrected_from,
             **metadata,
         }
@@ -1373,6 +1498,7 @@ class ContextStore:
                 raise UnknownSummaryKey(project_key, category, key, existing)
 
         archived_id = None
+        archived_ids = None
         previous_doc = None
         if current is not None:
             previous_doc, previous_meta, previous_emb = current
@@ -1380,7 +1506,8 @@ class ContextStore:
             if not allow_shrink and len(document) < len(previous_doc) * SHRINK_GUARD_RATIO:
                 raise SummaryShrinkRefused(sid, previous_doc, document)
 
-            archived_id = self._archive(sid, previous_doc, previous_meta, previous_emb)
+            archived_ids = self._archive(sid, previous_doc, previous_meta, previous_emb)
+            archived_id = archived_ids[0]
 
         metadata = {
             "project": project_key,
@@ -1406,6 +1533,7 @@ class ContextStore:
             "id": sid,
             "previous": previous_doc,
             "archived_id": archived_id,
+            "archived_split_into": len(archived_ids) if archived_ids and len(archived_ids) > 1 else None,
             "corrected_from": corrected_from,
             **metadata,
         }
@@ -1588,13 +1716,17 @@ if __name__ == "__main__":
     print(r["documents"])
 
     print("\n=== Truncation test ===")
-    long_text = "This is a very long chunk. " * 60  # > 800 chars
+    long_text = "This is a very long chunk. " * 60
+    assert len(long_text) > MAX_DOC_CHARS, "the fixture must actually exceed the cap"
     store.save(document=long_text, category="note", type="chunk", project=None, source="live")
     r = store.search("very long chunk", category="note")
     doc = r["documents"][0][0]
-    print(f"Returned doc length: {len(doc)} (should be <= ~815 incl. truncation marker)")
+    # Derived from the constant, not hardcoded: MAX_DOC_CHARS moved 800 -> 1000
+    # with chunk-splitting, and a magic number here silently outlives the change.
+    ceiling = MAX_DOC_CHARS + len(" …[truncated]")
+    print(f"Returned doc length: {len(doc)} (cap {MAX_DOC_CHARS} + marker = {ceiling})")
     print(doc[-40:])
-    assert len(doc) <= 820
+    assert len(doc) <= ceiling
 
     print("\n=== tier-stripped-for-general test ===")
     result = store.save(
@@ -1758,6 +1890,30 @@ if __name__ == "__main__":
     )
     print(f"touched {len('alpha')}/{len('alpha beta gamma delta')} chars, archived={res['archived_id']}")
     assert res["archived_id"] is not None, "a patch over the ratio should archive"
+
+    print("\n=== patch_summary: an APPEND-shaped patch archives too ===")
+    # The regression this guards: the ratio used to measure only len(old_str),
+    # so swapping a short marker for a large block displaced almost nothing
+    # while growing the document by half — and archived nothing. Live slots grew
+    # 45-145% in one session with zero checkpoints before this was fixed.
+    base = "HEADER. " + "Body text that makes this document a realistic length. " * 20
+    store.save(document=base, category="tasks", type="summary",
+               project="append-test", tier="personal", source="live")
+    injected = "MASSIVE NEW SECTION. " + "Freshly appended detail. " * 30
+    res = store.patch_summary(
+        old_str="HEADER.", new_str=f"HEADER.\n\n{injected}",
+        category="tasks", project="append-test",
+    )
+    displaced = len("HEADER.") / len(base)
+    print(f"  displaced {displaced:.1%} of the document but grew it "
+          f"{res['chars_before']} -> {res['chars_after']} ({res['delta']:+d}); "
+          f"archived={res['archived_id'] is not None}")
+    assert displaced < PATCH_ARCHIVE_RATIO, "fixture must displace less than the ratio"
+    assert res["archived_id"] is not None, \
+        "an append that injects more than the ratio must archive — growth is drift too"
+    assert store.slot_history("append-test", "tasks")["versions"][0]["content"] == base, \
+        "the checkpoint must hold the pre-append text"
+    print("  checkpoint holds the pre-append version.")
 
     print("\n=== Archived copies are ordinary, visible history ===")
     r = store.search("alpha beta gamma", project="patch-test", top_k=10)
@@ -2098,6 +2254,71 @@ if __name__ == "__main__":
     except ValueError:
         pass
     print("  refuses summaries, unknown ids, and blank reasons.")
+
+    print("\n=== _split_for_archive: the buffer, and what does NOT get split ===")
+    assert _split_for_archive("short") == ["short"]
+    # Inside the +10% buffer: over the display cap but not worth fragmenting.
+    inside = "x" * (MAX_DOC_CHARS + 50)
+    assert len(_split_for_archive(inside)) == 1, \
+        "a document inside the buffer must survive whole — that is the whole point of the buffer"
+    # A single oversized paragraph has no boundary to cut on, and inventing one
+    # would mean slicing mid-sentence.
+    assert len(_split_for_archive("y" * (SPLIT_THRESHOLD + 500))) == 1, \
+        "an unparagraphed document must come back whole, not hard-cut"
+    print(f"  cap {MAX_DOC_CHARS}, split trigger {SPLIT_THRESHOLD}; buffer and "
+          "unparagraphed text both left intact.")
+
+    para = "P{} " + "filler words to give this paragraph real length. " * 8
+    long_doc = "\n\n".join(para.format(i) for i in range(6))
+    pieces = _split_for_archive(long_doc)
+    print(f"  {len(long_doc)}ch in 6 paragraphs -> {len(pieces)} pieces, "
+          f"sizes {[len(p) for p in pieces]}")
+    assert len(pieces) > 1, "a genuinely oversized multi-paragraph document must split"
+    assert all(len(p) <= SPLIT_THRESHOLD for p in pieces), "no piece may exceed the threshold"
+    assert "\n\n".join(pieces) == long_doc, "splitting must be lossless — every byte survives"
+    assert all(p.strip() for p in pieces), "no empty pieces"
+    # Greedy packing, not one-paragraph-per-piece: 6 paragraphs must not become 6.
+    assert len(pieces) < 6, "paragraphs must be packed greedily, not split one per piece"
+
+    print("\n=== Archiving an oversized slot splits it, and history stitches it back ===")
+    store.update_summary(long_doc, category="note", project="splittest",
+                         tier="personal", key="big")
+    store.update_summary(long_doc + "\n\nP6 a new trailing paragraph.",
+                         category="note", project="splittest", tier="personal", key="big")
+    h = store.slot_history("splittest", "note", "big")
+    assert h["version_count"] == 1, \
+        f"one archival event is ONE version however many pieces it became, got {h['version_count']}"
+    v = h["versions"][0]
+    print(f"  archived as {v['pieces']} pieces, reassembled to {v['chars']}ch "
+          f"(original {len(long_doc)}ch)")
+    assert v["pieces"] > 1 and len(v["reassembled_from"]) == v["pieces"]
+    assert v["content"] == long_doc, "the stitched version must equal the original byte for byte"
+    assert "incomplete" not in v, "no piece should be missing"
+
+    # Each piece is independently searchable — the actual point of splitting.
+    # A blended embedding over the whole document is why a buried paragraph
+    # would not rank; per-piece vectors are what fix that.
+    hits = store.search("P4 filler words", project="splittest", top_k=10)
+    assert any(m.get("split_count") for m in hits["metadatas"][0]), \
+        "split pieces must be searchable in their own right"
+    piece_meta = next(m for m in hits["metadatas"][0] if m.get("split_count"))
+    assert piece_meta["split_count"] == v["pieces"]
+    assert piece_meta.get("superseded_from") == store.summary_id("splittest", "note", "big"), \
+        "a piece must still name the slot it came from"
+    print(f"  pieces searchable individually, each carrying split_count="
+          f"{piece_meta['split_count']} and its superseded_from.")
+
+    # An unsplit archive must NOT gain split metadata — the common case stays
+    # exactly as it was, including reusing its existing vector for free.
+    store.update_summary("Short value one, long enough to clear the shrink guard.",
+                         category="note", project="splittest", tier="personal",
+                         key="small", create_key=True)
+    store.update_summary("Short value two, long enough to clear the shrink guard.",
+                         category="note", project="splittest", tier="personal", key="small")
+    small = store.slot_history("splittest", "note", "small")["versions"][0]
+    assert "pieces" not in small and "reassembled_from" not in small, \
+        "an unsplit archive must carry no split bookkeeping at all"
+    print("  an unsplit archive stays exactly as before, no split metadata added.")
 
     shutil.rmtree(TEST_PATH, ignore_errors=True)
     shutil.rmtree(FALLBACK_PATH, ignore_errors=True)

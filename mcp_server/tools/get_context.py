@@ -30,7 +30,7 @@ DESCRIPTION = """Read stored context as whole documents — a project, one of it
     get_context(project, category)        just that category's slots
     get_context(project, category, key)   one slot
 
-Prefer this over search_context whenever the question is about CURRENT STATE — "what is the stack", "how is this set up", "where does this project stand". search_context ranks by similarity and cuts each hit to ~800 characters, so a long entry is only ever partly visible; this is a direct lookup and returns text whole. Search is for history and reasoning: "what did we decide about X", "why did we choose Y".
+Prefer this over search_context whenever the question is about CURRENT STATE — "what is the stack", "how is this set up", "where does this project stand". search_context ranks by similarity and cuts each hit to ~1000 characters, so a long entry is only ever partly visible; this is a direct lookup and returns text whole. Search is for history and reasoning: "what did we decide about X", "why did we choose Y".
 
 Check get_index FIRST if you don't know what's stored. It costs a fraction of this and shows every slot with its size, so you can tell what a call here would cost before paying it — a whole project can run to thousands of tokens.
 

@@ -14,11 +14,13 @@ DESCRIPTION = """Search the HISTORY of prior context — past decisions, archite
 
 Use this when the user references something from before ("last time we...", "what did we decide about...", "remind me how X works", "what's my usual approach to..."), when you start working on a project you don't already have context for, or when project-specific facts (tech stack, architecture, config, past decisions) or general facts/preferences about the user would materially improve your answer. Prefer checking here over assuming local memory has the full picture — it may not, especially for anything set up on another machine or in claude.ai.
 
-For CURRENT STATE, use get_context instead — "what is the stack", "how is this set up", "what does this project do". This tool ranks by similarity and truncates each hit to ~800 characters, so a long entry is only ever partly visible; get_context is a direct lookup and returns whole documents. Use this tool for questions about history and reasoning: "what did we decide about X", "why did we choose Y", "when did Z change".
+For CURRENT STATE, use get_context instead — "what is the stack", "how is this set up", "what does this project do". This tool ranks by similarity and truncates each hit to ~1000 characters, so a long entry is only ever partly visible; get_context is a direct lookup and returns whole documents. Use this tool for questions about history and reasoning: "what did we decide about X", "why did we choose Y", "when did Z change".
 
 Do NOT use this for general knowledge questions, for things already stated earlier in this same conversation, or as a substitute for reasoning about what's already in front of you — only to retrieve durable context saved in a previous session.
 
-Returns up to `top_k` matching entries, each with its `id`, its text (truncated to ~800 characters) and metadata (project, category, type, source, timestamp). Keep the id if you may need to act on that specific entry — retire_chunk takes one.
+Returns up to `top_k` matching entries, each with its `id`, its text (truncated to ~1000 characters) and metadata (project, category, type, source, timestamp). Keep the id if you may need to act on that specific entry — retire_chunk takes one.
+
+A long archived version arrives as several pieces rather than one clipped hit, each carrying a `split_note` saying which part it is. A piece is complete in itself but partial as a version — use get_history on that slot to read the whole thing.
 
 Results include earlier, archived versions of summaries alongside ordinary history chunks — both are history, and an archived version is often exactly what a "what did this used to say" question wants. Each carries `superseded_from` naming the slot it came from, so you can tell a past value from a standalone note.
 
@@ -73,10 +75,24 @@ def search_context(
     # on a specific entry, and retire_chunk needs one — without it a reader can
     # see that a chunk is wrong and have no way to say which chunk it meant.
     ids = raw.get("ids", [[]])[0]
-    results = [
-        {"id": cid, "content": doc, **meta}
-        for cid, doc, meta in zip(ids, docs, metas)
-    ]
+    results = []
+    for cid, doc, meta in zip(ids, docs, metas):
+        entry = {"id": cid, "content": doc, **meta}
+        # A split piece is sized to fit UNDER the truncation cap, so it never
+        # gets the " …[truncated]" marker that signals an incomplete document.
+        # It reads as a whole, self-contained entry when it is actually one
+        # section of a longer version — the one case where a result looks
+        # complete and isn't. Say so explicitly, or nothing will.
+        if meta.get("split_count"):
+            slot = meta.get("category")
+            if meta.get("key"):
+                slot = f"{slot}/{meta['key']}"
+            entry["split_note"] = (
+                f"Part {(meta.get('split_index') or 0) + 1} of {meta['split_count']} of one "
+                f"archived version of {slot}. This text is complete in itself but partial as a "
+                f"version — get_history on that slot returns every piece stitched back together."
+            )
+        results.append(entry)
 
     response: dict = {"results": results, "count": len(results)}
     corrected_from = raw.get("category_corrected_from")

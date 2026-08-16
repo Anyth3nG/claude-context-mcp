@@ -306,17 +306,23 @@ unprompted is a client-instruction problem, not a tool one.
 ## Retrieval budget
 
 `search_context` defaults to `top_k=5`, hard-capped at 10, and truncates each
-returned document to ~800 characters with a visible `…[truncated]` marker.
+returned document to `MAX_DOC_CHARS` (1000) with a visible `…[truncated]` marker.
 Prevents one call from dumping unbounded tokens into the conversation. If a
 query genuinely needs full content beyond that, the summary itself should be
 the thing that's short — this is a signal to fix the summary, not a reason to
 raise the cap by default.
 
+The cap was 800 until 2026-08-16. It was raised because the population of search
+results changed underneath it: 800 was calibrated for short, single-fact chunks
+written to add_update's own guidance, and once archived summaries became ordinary
+search results, hits were routinely far longer than anything the number was tuned
+against.
+
 ### Split at write time, not read time
 
 The cap is a display-time cut, so an entry longer than it is a *partly
-invisible* entry: no phrasing of any query reaches past the first 800
-characters. When this was measured, **21 of 23 stored chunks exceeded the cap**
+invisible* entry: no phrasing of any query reaches past the first
+`MAX_DOC_CHARS`. When this was measured, **21 of 23 stored chunks exceeded the cap**
 (median 2,584 characters), meaning `search_context` was returning a partial
 document roughly 91% of the time. The fix belongs at write time, where the
 material can still be divided along its own seams — only the writer knows where
@@ -333,6 +339,45 @@ Two things make that practical rather than merely advisable:
 - Writes that still exceed the cap come back flagged (`oversized`), at the
   moment splitting is free, rather than being discovered later as a silently
   truncated search result.
+
+### Splitting at archive time, where there is no writer to ask
+
+The two mechanisms above both assume a caller is present to divide the material
+along its own seams. `_archive()` has none — it runs automatically whenever a
+summary is replaced, patched past `PATCH_ARCHIVE_RATIO`, or archived outright.
+Once archived summaries became ordinary search results, that mattered: they are
+the longest documents in the store and nothing was cutting them.
+
+So `_split_for_archive()` splits them mechanically, and the constraints follow
+from having nobody to ask:
+
+- **Only at paragraph boundaries** (`\n\n`), a signal the author already put in
+  the text. A single paragraph over the threshold comes back **whole** — cutting
+  mid-sentence on a character count produces a piece that starts partway through
+  a clause, which is worse than a clip, because a clip is at least visibly a clip.
+- **Greedily packed**, not one paragraph per piece, which would shred a document
+  of short paragraphs into near-duplicates — the same pollution
+  `decisions/chunk-size-buffer` warns about, arriving by a different route.
+- **Only past `SPLIT_THRESHOLD`** (`MAX_DOC_CHARS` × 1.10 = 1100). That buffer is
+  `decisions/chunk-size-buffer` turned into a number: don't split to save a few
+  characters. Below it, archiving behaves exactly as before — one entry, reusing
+  the vector Chroma already holds, **zero embedding cost**.
+- **One Voyage call when it does split.** The pieces are new texts, so the old
+  vector no longer describes them and they must be embedded — but they go in one
+  upsert, so it is one call regardless of piece count. Per-piece vectors are the
+  actual point: a long document gets one blended embedding, so a query matching a
+  buried paragraph may not rank the document at all. Windowing the display cannot
+  fix that; only giving each piece its own vector can.
+
+Pieces carry `split_index` and `split_count` alongside the usual
+`superseded_from`, and every piece of one archival event shares its
+`superseded_at`. `get_history` groups on that stamp and stitches the pieces back
+in order, so one archival event reads as **one version**, not several — and
+reports `incomplete` if a piece is missing rather than silently returning short
+text. In `search_context`, a piece is sized to fit *under* the truncation cap, so
+it never gets the `…[truncated]` marker and would otherwise look like a complete
+entry; each one carries an explicit `split_note` saying which part it is and
+pointing at `get_history` for the whole.
 
 ## Example entries
 

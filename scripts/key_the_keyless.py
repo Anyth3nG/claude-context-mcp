@@ -147,7 +147,7 @@ def main() -> None:
     for project, category, _, old_id, _, doc, meta, emb in plan:
         archived = store._archive(old_id, doc, meta, emb)
         store.collection.delete(ids=[old_id])
-        print(f"  retired {old_id} (archived as {archived})")
+        print(f"  retired {old_id} (archived as {', '.join(archived)})")
 
     print(f"\nDone. Restore from {backup} if anything looks wrong.")
 
