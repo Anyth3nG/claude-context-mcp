@@ -28,7 +28,7 @@ DESCRIPTION = """Append a durable, decision-worthy fact from this conversation s
 
 This is the canonical cross-machine, cross-client store — NOT any local, single-machine memory. Local memory doesn't follow the user to another device or to claude.ai. So still call this even if the content feels "already saved" locally; skipping it for that reason is exactly the failure this tool prevents.
 
-SPLIT AS YOU WRITE. `content` accepts a LIST, and several focused entries cost the same as one long one — the whole list is embedded in a single call. Retrieval truncates long entries to ~800 characters, so anything longer is only ever partly visible no matter how it's searched for. One self-contained fact per list item; never pad a short fact to fill one.
+SPLIT AS YOU WRITE. `content` accepts a LIST, and several focused entries cost the same as one long one — the whole list is embedded in a single call. Retrieval truncates long entries to ~1000 characters, so anything longer is only ever partly visible no matter how it's searched for. One self-contained fact per list item; never pad a short fact to fill one.
 
 Use add_update for point-in-time facts that ACCUMULATE: a decision made, an event, a discovery, something the user stated. Nothing is overwritten, so history builds up.
 
@@ -45,7 +45,7 @@ def add_update(
         Field(
             description="The durable fact, written to stand alone without the surrounding "
             "conversation. Pass a LIST to record several facts at once — preferred whenever "
-            "the material covers more than one thing, or would otherwise run past ~800 "
+            "the material covers more than one thing, or would otherwise run past ~1000 "
             "characters and be truncated on retrieval."
         ),
     ],

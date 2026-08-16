@@ -192,7 +192,7 @@ def main() -> None:
         prev_doc, prev_meta, prev_emb = found
         archived = store._archive(sid, prev_doc, prev_meta, prev_emb)
         store.collection.delete(ids=[sid])
-        print(f"  retired {sid} (archived as {archived})")
+        print(f"  retired {sid} (archived as {', '.join(archived)})")
 
     print(f"\nDone. Restore from {backup} if anything looks wrong.")
 
