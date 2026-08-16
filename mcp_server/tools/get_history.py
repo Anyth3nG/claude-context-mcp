@@ -35,7 +35,7 @@ def get_history(
         str,
         Field(
             description="Which category the slot lives in: tech_stack, architecture, config, "
-            "decisions for project-scoped entries; preference, fact, goal, note for general ones."
+            "decisions for project-scoped entries; preference, fact, tasks, note for general ones."
         ),
     ],
     project: Annotated[
@@ -46,7 +46,7 @@ def get_history(
         Optional[str],
         Field(
             description="Sub-topic within the category, e.g. 'rotation' under config. "
-            "Omit for the category's main slot."
+            "REQUIRED — every summary lives under a key; there is no keyless main slot. get_index lists the ones in use."
         ),
     ] = None,
 ) -> dict:

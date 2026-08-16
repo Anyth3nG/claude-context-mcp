@@ -29,20 +29,25 @@ Project-scoped:
 General (`project = null`):
 - `preference` — how you like things done, working style
 - `fact` — durable facts about you
-- `goal` — things you're working toward or considering
+- `tasks` — things that need doing, each under a titled key
 - `note` — anything that doesn't fit the above but is worth keeping
 
 This list is expected to grow. Adding a category is cheap — a one-line change
 to `VALID_CATEGORIES` in `shared/store.py` — but it must be deliberate, not a
 typo that silently creates a bucket filtered queries can never find. Removing
-or renaming a category means a migration pass over existing data.
+or renaming a category means a migration pass over existing data — see
+`scripts/migrate_goal_to_tasks.py`, which renamed `goal` to `tasks` on
+2026-08-10 and is the reference for how to do it: summaries carry the category
+in their id and must be re-added under a new one, everything else needs only a
+metadata update, and the existing embedding is reused because the text is
+unchanged.
 
 The project/general grouping above is **guidance, not enforcement**:
 `VALID_CATEGORIES` is one flat set, and any category may be used with or
 without a project. It reflects where each category usually belongs, not a
-constraint the code applies. In practice `goal` is used project-scoped to hold
-a project's roadmap — which is genuinely a goal that belongs to a project — and
-`get_brief` returns every summary for a project regardless of which group its
+constraint the code applies. In practice `tasks` is used project-scoped to hold
+a project's outstanding work — which genuinely belongs to a project — and
+`get_context` returns every summary for a project regardless of which group its
 category nominally sits in.
 
 ## Collection structure in ChromaDB
@@ -83,11 +88,20 @@ so lists fail on reads against Cloud while working fine locally.
 
 ## Write semantics
 
-- **Summaries upsert** on a deterministic id: `f"{project}-{category}-summary"`
-  (or `f"general-{category}-summary"` when there's no project). Writing a new
+- **Summaries upsert** on a deterministic id: `f"summary-{project}-{category}"`
+  (or `f"summary-general-{category}"` when there's no project). Writing a new
   summary for the same project+category REPLACES the old one — there is only
   ever one living summary per slot. Enforced in `ContextStore.save()`, not
   left to callers to get right.
+
+  This id is **prefix-based**, matching `chunk-<hash>` and `superseded-<hash>`
+  so every id in the store announces its type from the first token. It was a
+  suffix (`f"{project}-{category}-summary"`) until 2026-08-16; the change forced
+  a one-time rename of all 102 slots plus the 87 `superseded_from` pointers that
+  referenced them (`scripts/summary_id_prefix.py`), because unlike sub-keys it is
+  **not** byte-compatible — an unmigrated slot stops matching `summary_id()` and
+  the next write against it creates a duplicate live document rather than
+  updating the original.
 - **Chunks insert** under a **content-addressed** id:
   `sha1(f"{project}-{category}-{document}")`. Same text in the same
   project+category is the same entry, always. This id previously mixed in
@@ -98,14 +112,26 @@ so lists fail on reads against Cloud while working fine locally.
   now collapses to one entry. A chunk carries no position or ordering, so a
   duplicate holds no information the first copy didn't, and its only effect on
   retrieval is to occupy a second slot in `top_k`.
+- **Chunks may also carry an optional `key`**, the same one summary sub-keys
+  use, which widens the id hash to `sha1(f"{project}-{category}-{key}-{document}")`.
+  Omitting it reproduces the original id byte for byte, so this is additive
+  the same way summary sub-keys are. Unlike a summary key, a chunk key is
+  never gated — no `create_key` check, and it does not need a matching
+  summary slot to exist. Filing a chunk under a key with no summary yet is
+  valid: raw material waiting to possibly be promoted later, not an error. A
+  superseded chunk (one archived from a summary slot via `_archive()`)
+  inherits its key automatically, since it's built from that slot's own
+  metadata.
 
 ### Sub-keys: one slot per topic, not per category
 
 A summary slot may carry an optional `key`, making its id
-`f"{project}-{category}-{key}-summary"`. **Omitting the key reproduces the
-original id byte for byte**, which is what makes this additive: slots written
+`f"summary-{project}-{category}-{key}"`. **Omitting the key reproduces the
+unkeyed id byte for byte**, which is what makes this additive: slots written
 before keys existed keep working untouched, and a bloated category is split when
-someone next has reason to touch it rather than in a migration.
+someone next has reason to touch it rather than in a migration. (That property is
+about the `key` alone — the `summary-` prefix arrived later and did need a
+migration, as noted above.)
 
 The motivation is retrieval, not write cost — `patch_summary` already solved the
 write side. Search truncates at 800 characters, so before splitting, the five
@@ -154,7 +180,7 @@ Replacement requires the caller to reproduce the entire new document — so
 altering one line of a 1,000-token summary means *generating* 1,000 tokens, the
 expensive and slow kind, to move a few characters. A patch sends only the diff.
 Measured against this store's own summaries at the time of the change:
-`context-mcp/config` was 966 tokens and `context-mcp/goal` 1,363, so every
+`context-mcp/config` was 966 tokens and `context-mcp/goal` (now `tasks`) 1,363, so every
 correction to either paid four figures of output tokens regardless of size.
 
 Patching is also the safer operation, which is why its guardrails are lighter:
@@ -201,6 +227,39 @@ malicious or ambiguous), but a silent correction would just relocate the
 original problem — an entry filed under a category the caller didn't
 realize was substituted.
 
+### Two tiers, not three: summaries are current, everything else is history
+
+A `summary` is the live tier — the only thing that answers "what is true now".
+Everything else is one uniform history tier: chunks appended through
+`add_update`, and ex-summaries archived from a slot, are the same kind of thing
+and rank together in search.
+
+That was three tiers until 2026-08-16, with `source: "superseded"` hidden from
+search behind an `include_superseded` flag. Hiding it was wrong on its own terms:
+
+- It contradicted the store's own distinction. `superseded` means "was true when
+  written", `retired` means "wrong" — hiding both identically erased the reason
+  the two values exist.
+- It never worked consistently. A live chunk that quietly goes stale was never
+  formally superseded (it was never part of a summary), so it stayed visible
+  forever. The "protect current-state answers from contradiction" goal was only
+  ever enforced against the subset that happened to pass through a summary slot.
+- Its worst case was a false negative. `archive_slot` leaves nothing behind, so
+  for a topic whose only slot was archived, the sole content that ever existed
+  became undiscoverable — strictly worse than surfacing an old answer with its
+  provenance attached.
+
+**`retired` is now the only source excluded by default** (`SEARCH_HIDDEN_SOURCES`),
+reachable with `include_retired=True` for auditing. `superseded_from` survives as
+provenance — it says which slot a copy came from, it just no longer gates
+visibility.
+
+One deliberate asymmetry: `index()` still excludes superseded copies from its
+`history_chunks` count (`INDEX_EXCLUDED_SOURCES`). Search visibility and map
+arithmetic are different questions — the index reports archived material
+separately as `prior_versions` and `archived_slots`, so counting it as history
+too would double-count it and make every edited slot look like growth.
+
 ## Reading: index first, then narrow
 
 Three read instruments, cheapest first. The order they're listed in is the order
@@ -209,9 +268,17 @@ they should be reached for:
 | Tool | Cost against this store | Answers |
 |---|---|---|
 | `get_index` | ~114 tokens | what exists, how big, how stale |
-| `get_value` | one category | what does X currently say |
-| `get_brief` | ~4,280 tokens (one project) | everything, whole |
+| `get_context(p, cat, key)` | one slot | what does this one slot say |
+| `get_context(p, cat)` | one category | what does X currently say |
+| `get_context(p)` | ~4,280 tokens (one project) | everything, whole |
 | `search_context` | ranked, truncated | history and reasoning |
+
+`get_context` was two tools until 2026-08-12, `get_brief` and `get_value`. They
+differed only in how much they returned — both deterministic lookups handing
+back whole documents — so depth now comes from how much of the address is
+supplied. The merge needed the keyless main slot gone first: while a category
+could hold both a keyless slot and keyed ones, `(project, category)` meant
+either "the category's own summary" or "everything filed under it".
 
 `ContextStore.index()` returns the map without any of the contents: one line per
 summary slot with its size and last-write date, plus a count of history chunks.
@@ -220,8 +287,8 @@ than similarity queries — and it stays small as the store grows, because there
 is only ever one living summary per project+category no matter how much history
 accumulates beneath it.
 
-The size figures are the point of it: they let a caller see what a `get_brief`
-or `get_value` would cost *before* paying it, so "is there anything relevant
+The size figures are the point of it: they let a caller see what a `get_context`
+would cost *before* paying it, so "is there anything relevant
 here" stops being a question that costs thousands of tokens to ask. Superseded
 archives are excluded from the counts — they are recoverable history, not part
 of what the store currently knows, and including them would make every edited

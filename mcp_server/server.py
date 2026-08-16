@@ -28,12 +28,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 from shared.config import load_secrets
 
 from mcp_server.auth import REASON_NO_TOKEN, log_auth_rejection, verifier_from_env
-# map_routes is intentionally not imported — see the note where the tools are
-# registered below.
+from mcp_server.map_routes import register_map_routes
 from mcp_server.tools.search_context import DESCRIPTION as SEARCH_CONTEXT_DESCRIPTION, search_context
 from mcp_server.tools.get_index import DESCRIPTION as GET_INDEX_DESCRIPTION, get_index
-from mcp_server.tools.get_brief import DESCRIPTION as GET_BRIEF_DESCRIPTION, get_brief
-from mcp_server.tools.get_value import DESCRIPTION as GET_VALUE_DESCRIPTION, get_value
+from mcp_server.tools.get_context import DESCRIPTION as GET_CONTEXT_DESCRIPTION, get_context
 from mcp_server.tools.get_history import DESCRIPTION as GET_HISTORY_DESCRIPTION, get_history
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
 from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
@@ -99,7 +97,7 @@ OAUTH_ENABLED = _token_verifier is not None
 # Every session pays for this, so it stays short.
 INSTRUCTIONS = """Durable memory for this user, shared across every machine and both clients (Claude Code and claude.ai). Context saved in another session is available in this one — do NOT assume it is empty, and do not re-derive what may already be recorded.
 
-Open with get_index(detail="projects"): a table of contents for tens of tokens. Then go only as deep as the task needs — get_brief(project), get_brief(project, category) to narrow it, get_value for one slot, get_history for how a slot changed, search_context when you don't know where to look.
+Open with get_index(detail="projects"): a table of contents for tens of tokens. Then go only as deep as the task needs — get_context(project), narrowed by category and then key, get_history for how a slot changed, search_context when you don't know where to look.
 
 Write sparingly: patch_context revises a fact that already has a value, add_update appends a new one. Decisions worth having later, not conversation."""
 
@@ -111,12 +109,12 @@ mcp = MCPServer(
 )
 # Read side, cheapest first — which is also the order they should be reached
 # for. get_index is a map with no contents and is what a session should open
-# with; get_brief/get_value are deterministic lookups returning whole documents;
-# search_context ranks and truncates, so it's for history only.
+# with; get_context is the deterministic lookup returning whole documents, at
+# whatever depth the address it is given implies; search_context ranks and
+# truncates, so it's for history only.
 mcp.add_tool(get_index, description=GET_INDEX_DESCRIPTION)
-mcp.add_tool(get_brief, description=GET_BRIEF_DESCRIPTION)
-mcp.add_tool(get_value, description=GET_VALUE_DESCRIPTION)
-# Between get_value and search_context by design: it answers "how did this
+mcp.add_tool(get_context, description=GET_CONTEXT_DESCRIPTION)
+# Between get_context and search_context by design: it answers "how did this
 # known slot change" deterministically, which is the question people reach for
 # search_context to answer and get ranking and truncation instead. Search stays
 # the tool for when you do NOT know where to look.
@@ -138,23 +136,20 @@ mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
 mcp.add_tool(retire_chunk, description=RETIRE_CHUNK_DESCRIPTION)
 # The other half of the same idea: retire_chunk says a fact was WRONG,
 # archive_slot says a slot's work is FINISHED. Both take something out of the
-# default read; only the first is a correction. Without this, `goal` had no way
+# default read; only the first is a correction. Without this, `tasks` had no way
 # to distinguish what needs doing from what was done, and completed phases kept
 # loading with every brief.
 mcp.add_tool(archive_slot, description=ARCHIVE_SLOT_DESCRIPTION)
 
-# /map and /map/data are NOT registered. Custom routes bypass MCP-level auth by
-# design, and /map/data serves the entire store — so they needed a guard of
-# their own, which was the static bearer token. That token is gone (see
-# auth.py), and these routes have no OAuth flow to fall back on: a browser
-# navigation cannot send an Authorization header, which is why the map was
-# already unreachable from a browser. Registering them now would publish the
-# whole store unauthenticated.
+# /map is registered again as of 2026-08-10, with the browser-compatible auth
+# path it always needed: a Cognito hosted-UI login terminating in a session
+# cookie, verified by the same CognitoTokenVerifier that guards /mcp. See
+# map_routes.py for why the guard lives inside the handlers — custom routes
+# bypass MCP-level auth by design, so nothing above them protects the store.
 #
-# map_routes.py and static/map.html are kept deliberately — they are the
-# starting point for the rebuild, where auth is designed in rather than bolted
-# on. Re-enable only together with a real browser-compatible auth path.
-# register_map_routes(mcp)
+# /map/data is deliberately NOT a route. The page inlines its data, so there is
+# no second endpoint serving the store and no fetch to authorize separately.
+register_map_routes(mcp)
 
 
 def _transport_security() -> TransportSecuritySettings:
@@ -196,13 +191,25 @@ class RejectStreamGet:
     asking, and a 405 discloses nothing — it says only that this endpoint speaks
     POST, which its own protocol documentation already says. Answering 401 first
     would mean an authenticated client still had to discover the hang.
+
+    SCOPED TO ONE PATH, and that is not a detail. This originally matched on
+    method alone, which was invisible while /mcp was the only route anyone
+    reached by GET — but it meant every other GET in the app got the same 405,
+    including the OAuth protected-resource metadata the SDK serves and, once it
+    was registered, the whole of /map. A GET elsewhere is not a client trying to
+    open a stream, and answering it here says nothing true about it.
     """
 
-    def __init__(self, app):
+    def __init__(self, app, path: str = "/mcp"):
         self.app = app
+        self.path = path
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("method") == "GET":
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path") == self.path
+        ):
             await send(
                 {
                     "type": "http.response.start",
@@ -282,10 +289,10 @@ def build_asgi_app():
     """
     Stateless streamable-HTTP app. Fresh instance per call.
 
-    No auth wrapper here any more: /mcp is guarded by the MCP layer itself
-    against Cognito, and the only routes that ever needed a separate gate were
-    /map*, which are no longer registered. The one wrapper that remains logs
-    rejections; it never decides them.
+    No auth wrapper here: /mcp is guarded by the MCP layer itself against
+    Cognito, and /map carries its own guard inside its handlers because custom
+    routes bypass that layer by design (see map_routes.py). The one wrapper
+    that remains logs rejections; it never decides them.
 
     That leaves one gap worth being loud about — if Cognito is not configured,
     the MCP layer has nothing to verify against and this app serves the store
