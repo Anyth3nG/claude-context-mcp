@@ -24,7 +24,7 @@ DESCRIPTION = """Retire a summary slot whose work is FINISHED, so it stops loadi
 
 Use this when a slot has stopped describing current state and started describing history — most often a finished piece of work. `tasks` is meant to answer "what needs doing next"; once something is done, its detail is a record of what happened, and leaving it live means every future session pays for it on every get_context.
 
-The text is not deleted. It is archived as a SUPERSEDED chunk, keeping its existing embedding, and comes back through search_context with include_superseded=True — which is how you compare what exists now against what was worked on before.
+The text is not deleted. It is archived as a SUPERSEDED chunk, keeping its existing embedding, and stays reachable through ordinary search_context results and through get_history on the slot — which is how you compare what exists now against what was worked on before.
 
 DO use this for: a finished piece of work, a task that has been done, a config surface that no longer exists, any slot that has become purely historical.
 
