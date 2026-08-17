@@ -36,7 +36,7 @@ Check get_index FIRST if you don't know what's stored. It costs a fraction of th
 
 NARROW WHENEVER YOU CAN. Passing a category is the difference between a few hundred tokens and several thousand on a project with real depth: a question about auth wants architecture and decisions, not the roadmap.
 
-ALSO use this before writing. patch_context needs text copied exactly from the stored summary, and change_update replaces a slot outright, so either way you need the current text in front of you first.
+ALSO use this before writing. patch_context needs text copied exactly from the stored summary to patch it, and replaces the slot outright if you pass `content` instead, so either way you need the current text in front of you first.
 
 Every response says what else is there, so the next call is obvious without a separate lookup: a project-level call lists `categories` with slot counts, a category-level call lists the other `siblings` categories, and a slot-level call lists the other keys beside it. An empty result means nothing is stored at that address, not that the project is unknown."""
 
@@ -126,7 +126,7 @@ def _one_slot(store, project, project_label, category, key) -> dict:
                     if siblings
                     else "This category has no slots yet."
                 )
-                + " change_update will create it; `key` is required when it does."
+                + " patch_context with `content` will create it; `key` is required when it does."
             ),
         }
 
@@ -185,6 +185,6 @@ def _many(store, project, project_label, category) -> dict:
             )
             if category
             else "No summaries recorded for this project yet. Try search_context for "
-            "history, or record current state with change_update."
+            "history, or record current state with patch_context."
         )
     return response

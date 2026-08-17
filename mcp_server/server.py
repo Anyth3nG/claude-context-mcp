@@ -34,10 +34,8 @@ from mcp_server.tools.get_index import DESCRIPTION as GET_INDEX_DESCRIPTION, get
 from mcp_server.tools.get_context import DESCRIPTION as GET_CONTEXT_DESCRIPTION, get_context
 from mcp_server.tools.get_history import DESCRIPTION as GET_HISTORY_DESCRIPTION, get_history
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
-from mcp_server.tools.change_update import DESCRIPTION as CHANGE_UPDATE_DESCRIPTION, change_update
 from mcp_server.tools.patch_context import DESCRIPTION as PATCH_CONTEXT_DESCRIPTION, patch_context
-from mcp_server.tools.retire_chunk import DESCRIPTION as RETIRE_CHUNK_DESCRIPTION, retire_chunk
-from mcp_server.tools.archive_slot import DESCRIPTION as ARCHIVE_SLOT_DESCRIPTION, archive_slot
+from mcp_server.tools.retire import DESCRIPTION as RETIRE_DESCRIPTION, retire
 
 # python-dotenv isn't in the Lambda bundle — there's no .env there. Import it
 # optionally so the same module works in both places.
@@ -120,26 +118,19 @@ mcp.add_tool(get_context, description=GET_CONTEXT_DESCRIPTION)
 # the tool for when you do NOT know where to look.
 mcp.add_tool(get_history, description=GET_HISTORY_DESCRIPTION)
 mcp.add_tool(search_context, description=SEARCH_CONTEXT_DESCRIPTION)
-# Write side, in the order they should be reached for: add_update appends
-# history, patch_context edits current state in place, change_update rewrites a
-# slot wholesale. patch_context is registered before change_update deliberately
-# — it is the default write, and change_update is now the exception, kept for
-# creating a slot or replacing one outright.
+# Write side, in the order they should be reached for. add_update appends to
+# history; patch_context writes current state, either as a diff or — since
+# change_update was folded into it — as a wholesale replacement, chosen by
+# whether old_str is present.
 mcp.add_tool(add_update, description=ADD_UPDATE_DESCRIPTION)
 mcp.add_tool(patch_context, description=PATCH_CONTEXT_DESCRIPTION)
-mcp.add_tool(change_update, description=CHANGE_UPDATE_DESCRIPTION)
-# Registered last because it is the rarest write and the only destructive-ish
-# one. The other three change what the store says; this one says an existing
-# entry was wrong. Chunks are append-only, so without it a disproved fact keeps
-# ranking against the entry that corrected it, with nothing marking which is
-# which — the failure the 2026-08-05 retrieval check surfaced.
-mcp.add_tool(retire_chunk, description=RETIRE_CHUNK_DESCRIPTION)
-# The other half of the same idea: retire_chunk says a fact was WRONG,
-# archive_slot says a slot's work is FINISHED. Both take something out of the
-# default read; only the first is a correction. Without this, `tasks` had no way
-# to distinguish what needs doing from what was done, and completed phases kept
-# loading with every brief.
-mcp.add_tool(archive_slot, description=ARCHIVE_SLOT_DESCRIPTION)
+# Registered last because it is the rarest write and the only one that takes
+# something OUT of the default read. It carries both senses of that, dispatched
+# by what it is pointed at: an id marks a chunk WRONG, a category retires a
+# FINISHED slot. Merged from retire_chunk and archive_slot, which is safe only
+# because the distinction is preserved in the tool's own responses — superseded
+# stays searchable as history, retired is held back as known-false.
+mcp.add_tool(retire, description=RETIRE_DESCRIPTION)
 
 # /map is registered again as of 2026-08-10, with the browser-compatible auth
 # path it always needed: a Cognito hosted-UI login terminating in a session

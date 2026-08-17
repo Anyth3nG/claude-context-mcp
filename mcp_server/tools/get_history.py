@@ -25,7 +25,7 @@ Prefer this over search_context for a known slot. Search ranks by similarity and
 
 Returns the live value (or null if the slot was archived outright), then each archived version with its text, when it was written, when it stopped being current, and any reason recorded at the time.
 
-For a slot archived by archive_slot — a finished phase, say — `current` is null and `archived_slot` is true. The work is done and the record is here.
+For a slot retired as finished — a completed phase, say — `current` is null and `archived_slot` is true. The work is done and the record is here.
 
 This is slot-scoped on purpose. "How did this entry evolve" is a different question from "what happened last Tuesday"; if you want the second, search_context with a date in the query is the closest thing today."""
 

@@ -1,7 +1,7 @@
 """
 Write tool: add_update. Appends chunks — the "diary" half of the store.
 
-Pairs with patch_context / change_update, which edit a living summary slot
+Pairs with patch_context, which writes a living summary slot
 instead of appending.
 
 Always type="chunk": insert-only, content-addressed id, never overwritten. A
