@@ -35,7 +35,7 @@ from mcp_server.tools.get_context import DESCRIPTION as GET_CONTEXT_DESCRIPTION,
 from mcp_server.tools.get_history import DESCRIPTION as GET_HISTORY_DESCRIPTION, get_history
 from mcp_server.tools.add_update import DESCRIPTION as ADD_UPDATE_DESCRIPTION, add_update
 from mcp_server.tools.patch_context import DESCRIPTION as PATCH_CONTEXT_DESCRIPTION, patch_context
-from mcp_server.tools.retire import DESCRIPTION as RETIRE_DESCRIPTION, retire
+from mcp_server.tools.archive import DESCRIPTION as ARCHIVE_DESCRIPTION, archive
 
 # python-dotenv isn't in the Lambda bundle — there's no .env there. Import it
 # optionally so the same module works in both places.
@@ -130,7 +130,7 @@ mcp.add_tool(patch_context, description=PATCH_CONTEXT_DESCRIPTION)
 # FINISHED slot. Merged from retire_chunk and archive_slot, which is safe only
 # because the distinction is preserved in the tool's own responses — superseded
 # stays searchable as history, retired is held back as known-false.
-mcp.add_tool(retire, description=RETIRE_DESCRIPTION)
+mcp.add_tool(archive, description=ARCHIVE_DESCRIPTION)
 
 # /map is registered again as of 2026-08-10, with the browser-compatible auth
 # path it always needed: a Cognito hosted-UI login terminating in a session

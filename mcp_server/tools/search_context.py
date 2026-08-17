@@ -18,7 +18,7 @@ For CURRENT STATE, use get_context instead — "what is the stack", "how is this
 
 Do NOT use this for general knowledge questions, for things already stated earlier in this same conversation, or as a substitute for reasoning about what's already in front of you — only to retrieve durable context saved in a previous session.
 
-Returns up to `top_k` matching entries, each with its `id`, its text (truncated to ~1000 characters) and metadata (project, category, type, source, timestamp). Keep the id if you may need to act on that specific entry — retire takes one.
+Returns up to `top_k` matching entries, each with its `id`, its text (truncated to ~1000 characters) and metadata (project, category, type, source, timestamp). Keep the id if you may need to act on that specific entry — archive takes one.
 
 A long archived version arrives as several pieces rather than one clipped hit, each carrying a `split_note` saying which part it is. A piece is complete in itself but partial as a version — use get_history on that slot to read the whole thing.
 
@@ -26,7 +26,7 @@ Results include earlier, archived versions of summaries alongside ordinary histo
 
 Excluded by default: only chunks retired as INCORRECT. That is a narrower exclusion than it sounds — superseded means "was true when written", retired means "wrong", and just those are held back.
 
-If a result contradicts a current summary, it is a candidate for retire: chunks are append-only, so a fact that was later disproved keeps ranking on the same queries as the entry that corrected it."""
+If a result contradicts a current summary, it is a candidate for archive: chunks are append-only, so a fact that was later disproved keeps ranking on the same queries as the entry that corrected it."""
 
 
 def search_context(
@@ -72,7 +72,7 @@ def search_context(
     docs = raw["documents"][0]
     metas = raw["metadatas"][0]
     # The id is carried through deliberately. It is the only handle a caller has
-    # on a specific entry, and retire needs one — without it a reader can
+    # on a specific entry, and archive needs one — without it a reader can
     # see that a chunk is wrong and have no way to say which chunk it meant.
     ids = raw.get("ids", [[]])[0]
     results = []

@@ -1,5 +1,5 @@
 """
-Write tool: retire. Takes something out of the default read, in the two ways
+Write tool: archive. Takes something out of the default read, in the two ways
 that can be meant — a slot whose work is FINISHED, or a chunk that is WRONG.
 
 These were archive_slot and retire_chunk. Merging them is only safe because the
@@ -13,6 +13,11 @@ false.
 Dispatch is on the shape of the target, not on a mode argument: an `id` names a
 chunk, a `category` (+key) names a slot. One signal, no combination to get wrong
 — the same reason get_context dispatches on how much of an address it is given.
+
+NAMED archive, NOT retire, and the difference matters. Both halves PRESERVE the
+text; neither deletes. "Archive" says that neutrally. "Retire" carries the
+judgement of the old retire_chunk, and under that name a caller closing finished
+work would be told it had marked something wrong.
 """
 from __future__ import annotations
 from typing import Annotated, Optional
@@ -26,7 +31,7 @@ from mcp_server.review_log import log_write
 
 DESCRIPTION = """Take an entry out of the default read, in one of two senses. Which one you get depends on what you point at, and they are NOT interchangeable.
 
-FINISHED WORK — pass `category` (+`key`, +`project`) to retire a whole summary slot. Use when a slot has stopped describing current state and become a record of what happened: a completed task, a config surface that no longer exists. The text is archived, stays searchable as history, and remains reachable through get_history. `tasks` is meant to answer "what needs doing next", so leaving finished work live makes every future session pay for it on every read.
+FINISHED WORK — pass `category` (+`key`, +`project`) to archive a whole summary slot. Use when a slot has stopped describing current state and become a record of what happened: a completed task, a config surface that no longer exists. The text is archived, stays searchable as history, and remains reachable through get_history. `tasks` is meant to answer "what needs doing next", so leaving finished work live makes every future session pay for it on every read.
 
 WRONG FACT — pass `id` (a chunk id from search_context) to mark a chunk INCORRECT. Use when a chunk contradicts something that is still true: chunks are append-only, so a fact later disproved keeps ranking on the same queries as whatever corrected it, and a reader has no way to tell which one holds. Retired chunks are excluded from search by default, because handing one back answers a question with material known to be false.
 
@@ -35,7 +40,7 @@ DO NOT use the id form on something merely old but still accurate — age is not
 `reason` is required either way, and is stored on the archived copy. Write it for someone who was not here: what completed the work, or what proved the fact wrong."""
 
 
-def retire(
+def archive(
     reason: Annotated[
         str,
         Field(
@@ -50,7 +55,7 @@ def retire(
         Field(
             description="WRONG-FACT MODE. A chunk id copied from a search_context result "
             '(e.g. "chunk-4c504f2f75588c82"). Do not construct one by hand. Marks that chunk '
-            "INCORRECT. Omit this to retire a finished slot instead."
+            "INCORRECT. Omit this to archive a finished slot instead."
         ),
     ] = None,
     category: Annotated[
@@ -94,7 +99,7 @@ def retire(
         return {
             "retired": False,
             "refused": "ambiguous_target",
-            "reason": "Pass `id` to mark a chunk WRONG, or `category` (+key) to retire a "
+            "reason": "Pass `id` to mark a chunk WRONG, or `category` (+key) to archive a "
             "FINISHED slot — not both. These mean different things and are refused rather "
             "than guessed at.",
         }
@@ -127,7 +132,7 @@ def _retire_chunk(store, chunk_id: str, reason: str, superseded_by: Optional[str
     if result.get("retired"):
         log_write(
             {
-                "tool": "retire",
+                "tool": "archive",
                 "action": "retired_incorrect",
                 "id": chunk_id,
                 "project": result.get("project"),
@@ -162,7 +167,7 @@ def _archive_slot(store, project, category, key, reason: str) -> dict:
 
     log_write(
         {
-            "tool": "retire",
+            "tool": "archive",
             "action": "archived_finished",
             "id": result["id"],
             "project": result.get("project"),
