@@ -33,6 +33,14 @@ GSI_BY_TYPE = "by_type"
 GSI_BY_ID = "by_id"
 VECTOR_INDEX = "semantic"
 
+# The embedding-guard item lives in its own partition and carries NO `type`, so
+# it is invisible to every read: count() and scan() reach records through the
+# by_type index or a typed filter, and a project-scoped query never names this
+# partition. That is deliberate — a bookkeeping row that showed up in count()
+# would break the store's own arithmetic.
+GUARD_PK = "__meta__"
+GUARD_SK = "embedding"
+
 # DynamoDB caps a BatchWriteItem at 25 items.
 BATCH_LIMIT = 25
 
@@ -75,6 +83,37 @@ class DynamoDriver:
         self.ddb = client or boto3.client(
             "dynamodb", region_name=region or os.environ.get("AWS_REGION", "eu-west-1")
         )
+
+    def assert_embedding_space(self, model_name: str) -> None:
+        """
+        Refuse to open a table that was written with a different embedding model.
+
+        Chroma does this natively — a collection remembers the embedding function
+        that created it and refuses a mismatched reopen — because mixing
+        embedding spaces corrupts similarity search silently: every write
+        succeeds, every search returns plausible nonsense, and nothing errors.
+        DynamoDB has no equivalent, so it is hand-rolled here.
+
+        Deliberately NOT part of the StorageDriver contract: it is a property of
+        this backend, not of the store, and Chroma's version is likewise tested
+        beside Chroma rather than in shared/conformance.py.
+        """
+        key = {"project": _ser.serialize(GUARD_PK), "sk": _ser.serialize(GUARD_SK)}
+        resp = self.ddb.get_item(TableName=self.table, Key=key, ConsistentRead=True)
+        recorded = resp.get("Item", {}).get("embedding_model", {}).get("S")
+        if recorded is None:
+            # First open of this table: claim the space rather than assume it.
+            self.ddb.put_item(TableName=self.table, Item={
+                **key, "embedding_model": _ser.serialize(model_name)})
+            return
+        if recorded != model_name:
+            raise RuntimeError(
+                f"Table '{self.table}' was written with embedding model "
+                f"'{recorded}', but you are opening it with '{model_name}'. "
+                "Mixing embedding spaces corrupts similarity search with no "
+                "error — every write succeeds and every search returns plausible "
+                "nonsense. Match the original model, or use a fresh table."
+            )
 
     # ---- addressing ------------------------------------------------------
     @staticmethod
