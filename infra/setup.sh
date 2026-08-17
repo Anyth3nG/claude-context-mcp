@@ -88,6 +88,11 @@ TIMEOUT_S=30
 HANDLER="mcp_server.server.handler"
 SECRET_NAME="context-mcp/credentials"
 LAMBDA_ROLE="context-mcp-lambda-role"
+# The DynamoDB store. Selected at runtime by the DYNAMODB_TABLE environment
+# variable — unset it and the Lambda falls back to Chroma, which is how a
+# rollback works without a code change. The table itself is created by
+# scripts/migrate_to_dynamodb.py, which owns the index and vector-index shape.
+DDB_TABLE="${DDB_TABLE:-context-mcp-store}"
 DEPLOY_ROLE="context-mcp-deploy-role"
 GITHUB_REPO="Anyth3nG/claude-context-mcp"
 # GitHub embeds immutable numeric ids in the OIDC subject claim, so the sub is
@@ -382,6 +387,25 @@ run aws iam put-role-policy --role-name "$LAMBDA_ROLE" --policy-name read-secret
     \"Effect\":\"Allow\",
     \"Action\":[\"secretsmanager:GetSecretValue\"],
     \"Resource\":\"${SECRET_ARN}-??????\"}]}" --no-cli-pager
+
+# DynamoDB access for the store, scoped to one table and its indexes.
+#
+# Scan is DELIBERATELY ABSENT. docs/dynamodb-schema.md shows every read
+# decomposing into a GetItem or a Query, so withholding Scan turns that design
+# into something the permission layer enforces rather than something a future
+# change could quietly violate. GetItem is here only for the embedding-space
+# guard, which reads one sentinel item.
+say "Granting $LAMBDA_ROLE access to DynamoDB table $DDB_TABLE"
+run aws iam put-role-policy --role-name "$LAMBDA_ROLE" --policy-name dynamodb-store \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{
+    \"Sid\":\"StoreReadWrite\",
+    \"Effect\":\"Allow\",
+    \"Action\":[\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",
+                 \"dynamodb:BatchWriteItem\",\"dynamodb:UpdateItem\",
+                 \"dynamodb:DeleteItem\",\"dynamodb:SearchVectors\"],
+    \"Resource\":[\"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${DDB_TABLE}\",
+                   \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${DDB_TABLE}/index/*\"]}]}" \
+  --no-cli-pager
 
 # --- Lambda function --------------------------------------------------------
 # Only non-secret configuration lives here: which secret to read, and which

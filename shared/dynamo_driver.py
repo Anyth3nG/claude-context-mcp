@@ -121,14 +121,22 @@ class DynamoDriver:
         category = meta.get("category") or "_"
         if meta.get("type") == "summary":
             return f"summary#{category}#{meta.get('key') or '_'}"
-        # A superseded copy sorts under its ORIGIN slot and its archival time, so
-        # slot_history is a partition query in time order and the pieces of one
-        # archival event land adjacent. See docs/dynamodb-schema.md.
+        # A superseded copy sorts under its ORIGIN slot, then by its own id.
+        #
+        # The id and NOT superseded_at, which is what an earlier version used.
+        # Chunk ids are content-addressed, so archiving identical text twice
+        # produces the SAME id — and it recurs in practice, because when a long
+        # slot is patched only the head changes and the tail split pieces are
+        # byte-identical across archival events. With a timestamp in the sort
+        # key those two archives became two items sharing one id: Chroma
+        # collapses them on id, DynamoDB cannot, since uniqueness is (PK, SK).
+        # Real data found this after the contract missed it.
+        #
+        # Nothing is lost by dropping the timestamp: slot_history already sorts
+        # on superseded_at in code, so the "free ordering" a timestamped key
+        # appeared to give was never actually being used.
         if meta.get("superseded_from"):
-            stamp = meta.get("superseded_at") or ""
-            piece = meta.get("split_index")
-            piece = 0 if piece is None else int(piece)
-            return f"superseded#{category}#{meta.get('key') or '_'}#{stamp}#{piece:03d}"
+            return f"superseded#{category}#{meta.get('key') or '_'}#{record_id}"
         return f"chunk#{category}#{record_id}"
 
     @staticmethod

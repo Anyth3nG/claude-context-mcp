@@ -613,6 +613,29 @@ def run(make_store) -> None:
         pass
     print("  refuses summaries, unknown ids, and blank reasons.")
 
+    print("\n=== Archiving the SAME content twice does not duplicate it ===")
+    # Content-addressed ids mean a repeated archive is the SAME record, and a
+    # backend must collapse it. Missed by this suite until a DynamoDB sort key
+    # containing a timestamp split one id across two items — which happens in
+    # practice because patching a long slot leaves its tail split pieces
+    # byte-identical between archival events.
+    A = "Value A, long enough to clear the shrink guard comfortably here."
+    B = "Value B, also long enough to clear the shrink guard comfortably."
+    store.update_summary(A, category="note", project="dupetest", tier="personal", key="cycle")
+    store.update_summary(B, category="note", project="dupetest", tier="personal", key="cycle")
+    store.update_summary(A, category="note", project="dupetest", tier="personal", key="cycle")
+    store.update_summary(B, category="note", project="dupetest", tier="personal", key="cycle")
+    dupe_rows = store.records(project="dupetest")
+    dupe_ids = [r["id"] for r in dupe_rows]
+    print(f"  4 writes cycling A/B/A/B -> {len(dupe_ids)} records, "
+          f"{len(set(dupe_ids))} distinct ids")
+    assert len(dupe_ids) == len(set(dupe_ids)), (
+        f"a record id appeared more than once: "
+        f"{[i for i in dupe_ids if dupe_ids.count(i) > 1]}")
+    hist = store.slot_history("dupetest", "note", "cycle")
+    assert all(v["content"] in (A, B) for v in hist["versions"])
+    print(f"  {hist['version_count']} archived versions, every id unique.")
+
     print("\n=== _split_for_archive: the buffer, and what does NOT get split ===")
     assert _split_for_archive("short") == ["short"]
     # Inside the +10% buffer: over the display cap but not worth fragmenting.

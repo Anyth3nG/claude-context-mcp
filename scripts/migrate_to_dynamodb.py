@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -110,8 +111,20 @@ def main() -> None:
     print(f"  {len(source)}/{len(source)} written")
 
     # ---- verification --------------------------------------------------
-    print("\nverifying…")
-    landed = driver.scan({}, with_documents=True)
+    #
+    # Global secondary indexes are eventually consistent, and scan() with no
+    # project reaches records through by_type — so a read taken the instant a
+    # bulk write finishes can disagree with itself. Observed once: 452 written,
+    # 455 read back, while every id, document and metadata field still matched.
+    # The data was right and the count was early. So converge before judging.
+    print("\nverifying (waiting for the index to settle)…")
+    landed = []
+    for attempt in range(12):
+        landed = driver.scan({}, with_documents=True)
+        if len(landed) == len(source):
+            break
+        print(f"  index still settling: {len(landed)} vs {len(source)} expected, retrying…")
+        time.sleep(5)
     src_by_id = {r["id"]: r for r in source}
     dst_by_id = {r["id"]: r for r in landed}
 
