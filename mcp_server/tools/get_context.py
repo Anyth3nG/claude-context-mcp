@@ -95,14 +95,9 @@ def _category_counts(store, project: Optional[str]) -> dict[str, int]:
     One metadata-only scan of the project's live summaries is 178ms and yields
     the same counts.
     """
-    got = store.collection.get(
-        where={"$and": [{"project": project or "general"}, {"type": "summary"},
-                        {"source": "live"}]},
-        include=["metadatas"],
-    )
     counts: dict[str, int] = {}
-    for meta in got["metadatas"]:
-        cat = meta.get("category")
+    for record in store.records(project=project or "general", type="summary", source="live"):
+        cat = record.get("category")
         if cat:
             counts[cat] = counts.get(cat, 0) + 1
     return counts

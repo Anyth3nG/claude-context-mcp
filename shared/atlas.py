@@ -61,14 +61,13 @@ def build_atlas_data(store) -> dict:
 
     # The live history: point-in-time facts that no summary represents. They
     # carry a project and a category, which is enough to place them.
-    raw = store.collection.get(where={"type": "chunk"}, include=["documents", "metadatas"])
     history: dict[str, list] = {}
-    for cid, doc, meta in zip(raw["ids"], raw["documents"], raw["metadatas"]):
-        if meta.get("source") != "live":
-            continue          # superseded and retired stay out; they belong to a slot
-        history.setdefault(meta.get("project") or "general", []).append({
-            "id": cid, "cat": meta.get("category") or "note", "text": doc,
-            "at": (meta.get("timestamp") or "")[:10], "chars": len(doc),
+    for record in store.records(type="chunk", source="live"):
+        # superseded and retired stay out; they belong to a slot
+        doc = record.get("document") or ""
+        history.setdefault(record.get("project") or "general", []).append({
+            "id": record["id"], "cat": record.get("category") or "note", "text": doc,
+            "at": (record.get("timestamp") or "")[:10], "chars": len(doc),
         })
     for v in history.values():
         v.sort(key=lambda c: (c["cat"], c["at"]))
