@@ -82,12 +82,20 @@ jobs:
           find build -name '__pycache__' -type d -exec rm -rf {} + || true
           cd build && zip -qr ../lambda.zip .
           cd .. && ls -lh lambda.zip
-          # 250MB unzipped / 50MB zipped are the hard Lambda limits for a
-          # non-container deploy. Measured ~110MB / ~33MB, so this is a
-          # regression alarm, not a routine constraint.
+          # 250MB unzipped / ~52MB zipped are the hard Lambda limits for a
+          # non-container deploy. Measured ~128MB / ~50MB since boto3 joined
+          # the bundle: unzipped is still a distant alarm, but ZIPPED is within
+          # a few percent of its cap, so it gets its own guard — without one,
+          # the failure would be an opaque RequestEntityTooLarge from
+          # update-function-code.
           unzipped=$(du -sm build | cut -f1)
-          echo "unzipped bundle: ${unzipped}MB"
+          zipped_bytes=$(stat -c%s lambda.zip)
+          echo "unzipped bundle: ${unzipped}MB, zipped: ${zipped_bytes} bytes"
           [ "$unzipped" -lt 240 ] || { echo "bundle too large for zip deploy"; exit 1; }
+          # The direct-upload cap is 52,428,800 bytes (50MiB). Fail a little
+          # short of it so the message names the problem instead of a raw
+          # RequestEntityTooLarge.
+          [ "$zipped_bytes" -lt 52000000 ] || { echo "zipped bundle within margin of the 52,428,800-byte direct-upload cap"; exit 1; }
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:

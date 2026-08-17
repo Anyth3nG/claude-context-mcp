@@ -35,5 +35,8 @@ PyJWT
 # could not catch it, having installed a current boto3 in the dev venv.
 #
 # ~35MB unzipped, almost all of it botocore's service models. The bundle sits at
-# roughly 108MB against a 250MB limit, and drops again when chromadb-client goes.
+# ~128MB unzipped against the 250MB limit — but ~50MB ZIPPED, within a few
+# percent of the ~52MB direct-upload cap, so the next sizeable dependency breaks
+# the deploy rather than the runtime. Dropping chromadb-client when the Chroma
+# rollback path retires buys the headroom back.
 boto3

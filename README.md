@@ -146,7 +146,10 @@ raised. `python -m shared.store` still works and just delegates.
 also carries its own `boto3` (~35MB): the runtime's copy predates DynamoDB's
 `SearchVectors` API, and that gap surfaced only in production — see the note in
 `requirements-lambda.txt`. The bundle has a hard 250MB unzipped limit and
-currently sits at ~110MB.
+currently sits at ~128MB unzipped / ~50MB zipped. The zipped figure is the one
+to watch: it is within a few percent of the ~52MB direct-upload cap, and
+crossing it breaks the deploy, not the runtime. Dropping `chromadb-client`
+once the Chroma rollback path retires buys the headroom back.
 
 ## Known gap: `/map` is not reproducible from infra
 
