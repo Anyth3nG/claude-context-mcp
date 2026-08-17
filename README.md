@@ -107,8 +107,21 @@ prune superseded versions.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # full chromadb, for a local store
-python -m shared.store                   # smoke suite, offline, no API keys
+python -m shared.smoke                   # full suite, offline, no API keys
 ```
+
+The suite is split in two on purpose. `shared/conformance.py` holds the
+**behavioural contract** — everything true of this store regardless of what
+stores it — and takes a factory, so it can be pointed at a second backend and a
+passing run is that backend's proof. `shared/smoke.py` is the Chroma harness: it
+runs the contract, then Chroma's own engine tests (the embedding-function
+mismatch guard, local-fallback reopen), which assert things about the engine
+rather than about this store's semantics.
+
+The entry point deliberately does **not** live in `shared/store.py`. Running that
+as `__main__` gives Python two copies of the module and two sets of exception
+classes, so `except PatchNoMatch` stops catching the `PatchNoMatch` that was
+raised. `python -m shared.store` still works and just delegates.
 
 `requirements.txt` pulls full `chromadb`; the Lambda bundle uses
 `requirements-lambda.txt` with the thin `chromadb-client`, which exposes
