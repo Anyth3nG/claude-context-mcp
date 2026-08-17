@@ -25,3 +25,14 @@ mangum
 # Cognito access-token verification. cryptography (needed for RS256) already
 # comes in via chromadb-client's dependency chain, so this adds very little.
 PyJWT
+
+# boto3, which the Lambda runtime ALSO provides — but the runtime's copy predates
+# DynamoDB's SearchVectors API and therefore cannot do vector search. That failed
+# in production and nowhere else: reads and writes use Query and PutItem, which
+# have existed for years, so the store looked healthy while search_context alone
+# raised "'DynamoDB' object has no attribute 'search_vectors'". Local testing
+# could not catch it, having installed a current boto3 in the dev venv.
+#
+# ~35MB unzipped, almost all of it botocore's service models. The bundle sits at
+# roughly 108MB against a 250MB limit, and drops again when chromadb-client goes.
+boto3
