@@ -244,7 +244,7 @@ search behind an `include_superseded` flag. Hiding it was wrong on its own terms
   formally superseded (it was never part of a summary), so it stayed visible
   forever. The "protect current-state answers from contradiction" goal was only
   ever enforced against the subset that happened to pass through a summary slot.
-- Its worst case was a false negative. `archive_slot` leaves nothing behind, so
+- Its worst case was a false negative. Archiving a slot leaves nothing behind, so
   for a topic whose only slot was archived, the sole content that ever existed
   became undiscoverable — strictly worse than surfacing an old answer with its
   provenance attached.
@@ -260,10 +260,51 @@ arithmetic are different questions — the index reports archived material
 separately as `prior_versions` and `archived_slots`, so counting it as history
 too would double-count it and make every edited slot look like growth.
 
+## The tool surface: seven
+
+Four to read, three to write. It was ten; the reductions were all merges of
+tools that differed only in degree, never in kind.
+
+| Tool | | |
+|---|---|---|
+| `get_index` | read | the map: what exists, how big, how stale. No contents. |
+| `get_context` | read | whole documents, at whatever depth the address implies |
+| `get_history` | read | how one known slot changed, newest first |
+| `search_context` | read | ranked and truncated; for when you don't know where to look |
+| `add_update` | write | append to history. Accumulates, never overwrites. |
+| `patch_context` | write | write current state — a diff, or a wholesale replacement |
+| `archive` | write | take something out of the default read |
+
+**Every merge dispatches on ONE field**, never on a combination and never on a
+mode argument:
+
+- `get_context` on **how much of an address** it is given (`project` →
+  `+category` → `+key`). Absorbed `get_brief` and `get_value`.
+- `patch_context` on **whether `old_str` is present**: a diff patches one
+  passage, `content` replaces or creates the slot. Absorbed `change_update`.
+- `archive` on **the shape of the target**: an `id` marks a chunk WRONG, a
+  `category` (+`key`) retires a FINISHED slot. Absorbed `archive_slot` and
+  `retire_chunk`.
+
+That constraint is load-bearing, not stylistic. A single merged *write* tool was
+designed and rejected because its dispatch signal would have been which subset of
+fields the caller happened to fill in — and measured against this store,
+tool-selection accuracy drops as mode-switching parameters accumulate. Where two
+operations differ in kind rather than degree they stay apart: `add_update`
+accumulates and `patch_context` replaces, and conflating them is what once lost
+writes silently.
+
+`archive` is the one merge whose halves mean opposite things — archiving says
+"this was true and is now history", retiring says "this was never true" — so its
+response states which happened in an `action` field (`archived_finished` /
+`retired_incorrect`) rather than leaving it to be inferred. It is named
+`archive` and not `retire` because both halves *preserve* the text; "retire"
+carries the judgement of only one of them.
+
 ## Reading: index first, then narrow
 
-Three read instruments, cheapest first. The order they're listed in is the order
-they should be reached for:
+Read instruments, cheapest first. The order they're listed in is the order they
+should be reached for:
 
 | Tool | Cost against this store | Answers |
 |---|---|---|
@@ -271,6 +312,7 @@ they should be reached for:
 | `get_context(p, cat, key)` | one slot | what does this one slot say |
 | `get_context(p, cat)` | one category | what does X currently say |
 | `get_context(p)` | ~4,280 tokens (one project) | everything, whole |
+| `get_history(p, cat, key)` | one slot's versions | how did this change |
 | `search_context` | ranked, truncated | history and reasoning |
 
 `get_context` was two tools until 2026-08-12, `get_brief` and `get_value`. They
