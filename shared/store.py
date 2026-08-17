@@ -512,6 +512,7 @@ class ContextStore:
         embedding_function_name: Optional[str] = None,
         allow_local_fallback: bool = False,
         use_cloud: Optional[bool] = None,
+        driver: Optional[StorageDriver] = None,
     ):
         """
         Voyage is REQUIRED by default (see docs/schema.md decision) — this
@@ -524,6 +525,16 @@ class ContextStore:
           embedding_function AND embedding_function_name.
         - Explicit, deliberate opt-out of Voyage: allow_local_fallback=True.
         """
+        if driver is not None:
+            # A backend was supplied outright, so none of the Chroma
+            # construction below applies: the driver owns its own connection
+            # and its own embedding. self.client and self.collection stay unset,
+            # and nothing in this class touches them.
+            self.driver = driver
+            self.client = None
+            self.collection = None
+            return
+
         if embedding_function is None:
             api_key = os.environ.get("VOYAGE_API_KEY")
             if api_key:

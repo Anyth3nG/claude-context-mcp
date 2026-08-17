@@ -14,3 +14,4 @@ numpy
 mcp
 PyJWT
 python-dotenv
+boto3  # dev only: the Lambda runtime ships it, so it stays out of requirements-lambda.txt
