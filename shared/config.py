@@ -28,12 +28,18 @@ SECRET_ID_VAR = "CONTEXT_MCP_SECRET_ID"
 # fallback on /mcp; both uses are gone and the endpoint is OAuth-only, so the
 # key is no longer required. Any value still sitting in the secret is ignored —
 # extra keys are loaded into the environment but nothing reads them.
-_EXPECTED_KEYS = (
-    "VOYAGE_API_KEY",
-    "CHROMA_TENANT",
-    "CHROMA_DATABASE",
-    "CHROMA_API_KEY",
-)
+#
+# Required on every backend: DynamoDB stores vectors, but Voyage still
+# produces them.
+_ALWAYS_REQUIRED = ("VOYAGE_API_KEY",)
+
+# Required only when the Chroma path is live (DYNAMODB_TABLE unset). Enforcing
+# them unconditionally would mean stripping the Chroma credentials from the
+# secret takes the server down on the next cold start even though the DynamoDB
+# path never reads them; enforcing them conditionally keeps the rollback path
+# (unset DYNAMODB_TABLE) failing fast on a gutted secret rather than three
+# frames later.
+_CHROMA_KEYS = ("CHROMA_TENANT", "CHROMA_DATABASE", "CHROMA_API_KEY")
 
 _loaded = False
 
@@ -70,13 +76,16 @@ def load_secrets(force: bool = False) -> bool:
         if value is not None:
             os.environ.setdefault(key, str(value))
 
-    missing = [k for k in _EXPECTED_KEYS if not os.environ.get(k)]
+    expected = _ALWAYS_REQUIRED
+    if not os.environ.get("DYNAMODB_TABLE"):
+        expected += _CHROMA_KEYS
+    missing = [k for k in expected if not os.environ.get(k)]
     if missing:
         # Fail here, naming what's absent, rather than letting ContextStore
         # raise a confusing "no VOYAGE_API_KEY" three frames later.
         raise RuntimeError(
             f"Secret '{secret_id}' is missing required keys: {', '.join(missing)}. "
-            f"It must be a JSON object containing: {', '.join(_EXPECTED_KEYS)}."
+            f"It must be a JSON object containing: {', '.join(expected)}."
         )
 
     _loaded = True
