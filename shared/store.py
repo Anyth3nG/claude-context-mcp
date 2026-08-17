@@ -13,6 +13,8 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+from shared.drivers import ChromaDriver, StorageDriver
+
 COLLECTION_NAME = "context_store"
 
 # Locked taxonomy from docs/schema.md. Extending this is a one-line change
@@ -52,12 +54,6 @@ MAX_DOC_CHARS = 1000
 # call, so the same tolerance has to be a number.
 SPLIT_BUFFER_RATIO = 1.10
 SPLIT_THRESHOLD = int(MAX_DOC_CHARS * SPLIT_BUFFER_RATIO)
-
-# Chroma Cloud refuses a Get asking for more than this, and silently returns at
-# most this many when asked for everything. Any read that walks a whole result
-# set must page with it or it will confidently report on a subset — see
-# tasks/get-pagination, which is the same defect in index().
-GET_PAGE = 300
 
 # How close a typo must be to auto-correct (0-1, difflib ratio).
 CATEGORY_MATCH_CUTOFF = 0.75
@@ -557,6 +553,10 @@ class ContextStore:
         self.collection = self._open_or_create_collection(
             embedding_function, embedding_function_name
         )
+        # Every physical read and write goes through here. self.collection is
+        # kept only for the Chroma-specific engine tests in shared/smoke.py —
+        # nothing in this class touches it directly any more.
+        self.driver: StorageDriver = ChromaDriver(self.collection)
 
     def _open_or_create_collection(self, embedding_function, embedding_function_name):
         existing_names = [c.name for c in self.client.list_collections()]
@@ -626,7 +626,7 @@ class ContextStore:
         if corrected_from:
             metadata["category_corrected_from"] = corrected_from
 
-        self.collection.upsert(ids=[id], documents=[document], metadatas=[metadata])
+        self.driver.put([{"id": id, "document": document, "metadata": metadata}])
         return {"id": id, "corrected_from": corrected_from, **metadata}
 
     def summary_id(self, project: Optional[str], category: str, key: Optional[str] = None) -> str:
@@ -666,12 +666,11 @@ class ContextStore:
         been migrated rather than a crash.
         """
         category, _ = _normalize_category(category)
-        got = self.collection.get(
-            where={"$and": [{"project": project or "general"}, {"category": category},
-                            {"type": "summary"}]},
-            include=["metadatas"],
+        found = self.driver.scan(
+            {"project": project or "general", "category": category, "type": "summary"},
+            with_documents=False,
         )
-        keys = {meta.get("key") or None for meta in got["metadatas"]}
+        keys = {r["metadata"].get("key") or None for r in found}
         return ([None] if None in keys else []) + sorted(k for k in keys if k)
 
     def summary_keys_ranked(
@@ -696,13 +695,12 @@ class ContextStore:
         existing = self.summary_keys(project, category)
         if not existing:
             return []
-        got = self.collection.query(
-            query_texts=[content],
-            n_results=len(existing),
-            where={"$and": [{"project": project or "general"}, {"category": category},
-                            {"type": "summary"}]},
+        hits = self.driver.similar(
+            content,
+            {"project": project or "general", "category": category, "type": "summary"},
+            top_k=len(existing),
         )
-        ranked = [meta.get("key") or None for meta in got["metadatas"][0]]
+        ranked = [h["metadata"].get("key") or None for h in hits]
         # Anything the query didn't return still belongs in the list, just last.
         return ranked + [k for k in existing if k not in ranked]
 
@@ -811,9 +809,8 @@ class ContextStore:
 
         ids = list(by_id)
         docs = [by_id[i] for i in ids]
-        self.collection.upsert(
-            ids=ids, documents=docs, metadatas=[dict(metadata) for _ in ids]
-        )
+        self.driver.put([{"id": i, "document": d, "metadata": dict(metadata)}
+                         for i, d in zip(ids, docs)])
         return {
             "ids": ids,
             "count": len(ids),
@@ -839,16 +836,12 @@ class ContextStore:
         """
         category, _ = _normalize_category(category)
         key = _normalize_key(key)
-        include = ["documents", "metadatas"] + (["embeddings"] if with_embedding else [])
-        got = self.collection.get(ids=[self.summary_id(project, category, key)], include=include)
-        if not got["ids"]:
+        found = self.driver.fetch([self.summary_id(project, category, key)],
+                                  with_embeddings=with_embedding)
+        if not found:
             return None
-        emb = got.get("embeddings")
-        return (
-            got["documents"][0],
-            got["metadatas"][0],
-            emb[0] if with_embedding and emb is not None and len(emb) else None,
-        )
+        rec = found[0]
+        return (rec["document"], rec["metadata"], rec.get("embedding"))
 
     def get_brief(
         self, project: Optional[str] = None, category: Optional[str] = None
@@ -871,25 +864,21 @@ class ContextStore:
         search layer, one level up.
         """
         project_key = project or "general"
-        clauses: list[dict] = [{"project": project_key}, {"type": "summary"}]
+        filt: dict = {"project": project_key, "type": "summary"}
         corrected_from = None
         if category is not None:
             category, corrected_from = _normalize_category(category)
-            clauses.append({"category": category})
-        got = self.collection.get(
-            where={"$and": clauses},
-            include=["documents", "metadatas"],
-        )
+            filt["category"] = category
         entries = [
             {
-                "category": meta.get("category"),
-                "key": meta.get("key"),
-                "content": doc,
-                "tier": meta.get("tier"),
-                "source": meta.get("source"),
-                "timestamp": meta.get("timestamp"),
+                "category": r["metadata"].get("category"),
+                "key": r["metadata"].get("key"),
+                "content": r["document"],
+                "tier": r["metadata"].get("tier"),
+                "source": r["metadata"].get("source"),
+                "timestamp": r["metadata"].get("timestamp"),
             }
-            for doc, meta in zip(got["documents"], got["metadatas"])
+            for r in self.driver.scan(filt)
         ]
         # Stable, readable order rather than whatever the store returns. Slots
         # of one category group together, the unkeyed one leading.
@@ -926,9 +915,7 @@ class ContextStore:
         category, corrected_from = _normalize_category(category)
         key = _normalize_key(key)
         sid = self.summary_id(project, category, key)
-        got = self.collection.get(
-            where={"superseded_from": sid}, include=["documents", "metadatas"]
-        )
+        found = self.driver.scan({"superseded_from": sid})
         # An oversized version was archived as several pieces (see
         # _split_for_archive), and one archival event is ONE version of the slot,
         # not three. Group by superseded_at — every piece of a single _archive
@@ -936,8 +923,10 @@ class ContextStore:
         # back in order, so history reads as a version chain rather than as a
         # pile of fragments the caller has to reassemble.
         by_event: dict[str, list] = {}
-        for vid, doc, meta in zip(got["ids"], got["documents"], got["metadatas"]):
-            by_event.setdefault(meta.get("superseded_at") or "", []).append((vid, doc, meta))
+        for r in found:
+            meta = r["metadata"]
+            by_event.setdefault(meta.get("superseded_at") or "", []).append(
+                (r["id"], r["document"], meta))
 
         versions = []
         for stamp, members in by_event.items():
@@ -1027,9 +1016,11 @@ class ContextStore:
                 "documents": [previous_doc],
                 "metadatas": [archive_meta],
             }
+            record = {"id": archive_kwargs["ids"][0], "document": previous_doc,
+                      "metadata": archive_meta}
             if previous_emb is not None:
-                archive_kwargs["embeddings"] = [previous_emb]
-            self.collection.upsert(**archive_kwargs)
+                record["embedding"] = previous_emb
+            self.driver.put([record])
             return archive_kwargs["ids"]
 
         ids, metas = [], []
@@ -1040,9 +1031,10 @@ class ContextStore:
             digest = hashlib.sha1(f"{sid}-{i}-{piece}".encode()).hexdigest()[:16]
             ids.append(f"superseded-{digest}")
             metas.append({**archive_meta, "split_index": i, "split_count": len(pieces)})
-        # No embeddings passed: each piece is a new text and needs its own vector.
-        # One upsert, so Chroma issues one embed call for the whole batch.
-        self.collection.upsert(ids=ids, documents=pieces, metadatas=metas)
+        # No embeddings supplied: each piece is a new text and needs its own
+        # vector. One put, so the driver embeds the whole batch in one call.
+        self.driver.put([{"id": i, "document": d, "metadata": m}
+                         for i, d, m in zip(ids, pieces, metas)])
         return ids
 
     def archive_slot(
@@ -1087,7 +1079,7 @@ class ContextStore:
         # Only now drop the live document. If _archive raised, the slot is still
         # intact — losing the copy and the original in one call is the failure
         # this ordering exists to prevent.
-        self.collection.delete(ids=[sid])
+        self.driver.remove([sid])
         return {
             "archived": True,
             "id": sid,
@@ -1128,12 +1120,12 @@ class ContextStore:
         if not reason or not reason.strip():
             raise ValueError("reason is required — a retired chunk with no stated reason is worse than none")
 
-        got = self.collection.get(ids=[chunk_id], include=["documents", "metadatas"])
-        if not got["ids"]:
+        found = self.driver.fetch([chunk_id])
+        if not found:
             raise ChunkNotFound(chunk_id)
 
-        meta = dict(got["metadatas"][0])
-        document = got["documents"][0]
+        meta = dict(found[0]["metadata"])
+        document = found[0]["document"]
         if meta.get("type") != "chunk":
             raise ValueError(
                 f"'{chunk_id}' is a {meta.get('type')}, not a chunk. Replace a summary's "
@@ -1164,7 +1156,7 @@ class ContextStore:
             meta["superseded_by"] = superseded_by
         # update(), not upsert(): the document and its embedding stay exactly as
         # they are, so this is a metadata write and nothing is re-embedded.
-        self.collection.update(ids=[chunk_id], metadatas=[meta])
+        self.driver.update_metadata(chunk_id, meta)
         return {
             "retired": True,
             "id": chunk_id,
@@ -1273,7 +1265,7 @@ class ContextStore:
         if corrected_from:
             metadata["category_corrected_from"] = corrected_from
 
-        self.collection.upsert(ids=[sid], documents=[patched], metadatas=[metadata])
+        self.driver.put([{"id": sid, "document": patched, "metadata": metadata}])
         return {
             "id": sid,
             # Deliberately NOT the patched document. Returning it would hand
@@ -1303,63 +1295,9 @@ class ContextStore:
     # architecture/dynamodb-vector-search). Anything expressible here ports;
     # anything that needed more would not have.
 
-    def _where(
-        self,
-        project: Optional[str] = None,
-        category: Optional[str] = None,
-        type: Optional[str] = None,
-        source: Optional[str] = None,
-        key: Optional[str] = None,
-        superseded_from: Optional[str] = None,
-        exclude_sources: Optional[tuple] = None,
-    ) -> Optional[dict]:
-        clauses: list[dict] = []
-        for field, value in (("project", project), ("category", category),
-                             ("type", type), ("source", source), ("key", key),
-                             ("superseded_from", superseded_from)):
-            if value is not None:
-                clauses.append({field: value})
-        if exclude_sources:
-            excluded = list(exclude_sources)
-            clauses.append({"source": {"$ne": excluded[0]} if len(excluded) == 1
-                            else {"$nin": excluded}})
-        if not clauses:
-            return None
-        return clauses[0] if len(clauses) == 1 else {"$and": clauses}
-
-    def _paged(self, where: Optional[dict], include: list) -> dict:
-        """
-        Every matching record, page by page.
-
-        Chroma Cloud caps a single get() at GET_PAGE and returns at most that
-        many when asked for everything, WITHOUT indicating there was more — so
-        an unpaginated count is silently wrong above the cap. This is used by
-        the introspection methods below so they cannot lie about totals.
-        """
-        ids: list[str] = []
-        metas: list[dict] = []
-        docs: list[str] = []
-        offset = 0
-        while True:
-            kwargs = {"limit": GET_PAGE, "offset": offset, "include": include}
-            if where is not None:
-                kwargs["where"] = where
-            page = self.collection.get(**kwargs)
-            if not page["ids"]:
-                break
-            ids.extend(page["ids"])
-            metas.extend(page.get("metadatas") or [])
-            docs.extend(page.get("documents") or [])
-            if len(page["ids"]) < GET_PAGE:
-                break
-            offset += GET_PAGE
-        return {"ids": ids, "metadatas": metas, "documents": docs}
-
     def count(self, **filters) -> int:
         """How many records match. No filters means every record in the store."""
-        if not filters:
-            return self.collection.count()
-        return len(self._paged(self._where(**filters), include=[])["ids"])
+        return self.driver.count(filters or None)
 
     def record(self, record_id: str) -> Optional[dict]:
         """
@@ -1369,16 +1307,16 @@ class ContextStore:
         chunk, a superseded copy, a retired fact — and returns metadata as
         stored rather than reshaped.
         """
-        got = self.collection.get(ids=[record_id], include=["documents", "metadatas"])
-        if not got["ids"]:
+        found = self.driver.fetch([record_id])
+        if not found:
             return None
-        return {"id": got["ids"][0], "document": got["documents"][0], **got["metadatas"][0]}
+        return {"id": found[0]["id"], "document": found[0]["document"],
+                **found[0]["metadata"]}
 
     def records(self, **filters) -> list[dict]:
-        """Every matching record, same shape as record(). Paginated."""
-        got = self._paged(self._where(**filters), include=["documents", "metadatas"])
-        return [{"id": i, "document": d, **m}
-                for i, d, m in zip(got["ids"], got["documents"], got["metadatas"])]
+        """Every matching record, same shape as record(). Paginated by the driver."""
+        return [{"id": r["id"], "document": r["document"], **r["metadata"]}
+                for r in self.driver.scan(filters)]
 
     def index(self, project: Optional[str] = None, detail: str = "slots") -> dict:
         """
@@ -1408,33 +1346,28 @@ class ContextStore:
         """
         if detail not in ("slots", "projects"):
             raise ValueError(f"detail must be 'slots' or 'projects', got '{detail}'")
-        summary_where: dict = {"type": "summary"}
-        chunk_clauses: list[dict] = [{"type": "chunk"},
-                                     {"source": {"$nin": list(INDEX_EXCLUDED_SOURCES)}}]
+        summary_filt: dict = {"type": "summary"}
+        chunk_filt: dict = {"type": "chunk", "exclude_sources": INDEX_EXCLUDED_SOURCES}
         if project:
-            summary_where = {"$and": [summary_where, {"project": project}]}
-            chunk_clauses.append({"project": project})
+            summary_filt["project"] = project
+            chunk_filt["project"] = project
 
-        summaries = self.collection.get(
-            where=summary_where, include=["documents", "metadatas"]
-        )
         # Documents are fetched only to measure them; the text never leaves this
-        # method. Cheap because there is one summary per slot — a handful of
-        # documents, not the whole store.
-        chunks = self.collection.get(
-            where={"$and": chunk_clauses}, include=["metadatas"]
-        )
+        # method. docs/dynamodb-schema.md proposes storing `chars` at write time
+        # so this stops reading text at all.
+        summaries = self.driver.scan(summary_filt)
+        chunks = self.driver.scan(chunk_filt, with_documents=False)
         # Archived copies, counted per slot they came from. The index is what a
         # session reads to decide where to look next, so it has to advertise
         # what the next level down actually holds — a slot rewritten five times
         # is worth knowing about, and without this the version chain is
         # invisible unless someone already suspects it exists.
-        archived_where: dict = {"source": SUPERSEDED_SOURCE}
+        archived_filt: dict = {"source": SUPERSEDED_SOURCE}
         if project:
-            archived_where = {"$and": [archived_where, {"project": project}]}
-        archived = self.collection.get(where=archived_where, include=["metadatas"])
+            archived_filt["project"] = project
+        archived = self.driver.scan(archived_filt, with_documents=False)
         versions_per_slot: dict[str, int] = {}
-        for meta in archived["metadatas"]:
+        for meta in (r["metadata"] for r in archived):
             origin = meta.get("superseded_from")
             if origin:
                 versions_per_slot[origin] = versions_per_slot.get(origin, 0) + 1
@@ -1451,20 +1384,20 @@ class ContextStore:
         # session that retired work exists here without listing what it was.
         live_ids = {
             self.summary_id(m.get("project"), m.get("category"), m.get("key"))
-            for m in summaries["metadatas"]
+            for m in (r["metadata"] for r in summaries)
         }
         # Distinct ORIGINS, not archived copies. A slot rewritten five times and
         # then archived is one archived slot, not five, and counting versions
         # here would inflate every long-lived project.
         archived_origins: dict[str, set] = {}
-        for meta in archived["metadatas"]:
+        for meta in (r["metadata"] for r in archived):
             origin = meta.get("superseded_from")
             if origin and origin not in live_ids:
                 proj = meta.get("project") or "general"
                 archived_origins.setdefault(proj, set()).add(origin)
         archived_only = {p: len(v) for p, v in archived_origins.items()}
 
-        for doc, meta in zip(summaries["documents"], summaries["metadatas"]):
+        for doc, meta in ((r["document"], r["metadata"]) for r in summaries):
             entry = slot(meta.get("project") or "general")
             # Keyed slots are labelled "category/key" and unkeyed ones just
             # "category", so one flat mapping shows the whole shape of a project
@@ -1488,7 +1421,7 @@ class ContextStore:
             if meta.get("tier"):
                 entry["tier"] = meta["tier"]
 
-        for meta in chunks["metadatas"]:
+        for meta in (r["metadata"] for r in chunks):
             entry = slot(meta.get("project") or "general")
             entry["history_chunks"] += 1
             if meta.get("tier"):
@@ -1525,16 +1458,16 @@ class ContextStore:
                 toc[name] = row
             return {
                 "projects": toc,
-                "total_summaries": len(summaries["ids"]),
-                "total_history_chunks": len(chunks["ids"]),
+                "total_summaries": len(summaries),
+                "total_history_chunks": len(chunks),
                 "next": "get_context(project) for one project's current state, "
                         "or get_index(project=...) for its individual slots.",
             }
 
         return {
             "projects": dict(sorted(projects.items())),
-            "total_summaries": len(summaries["ids"]),
-            "total_history_chunks": len(chunks["ids"]),
+            "total_summaries": len(summaries),
+            "total_history_chunks": len(chunks),
         }
 
     def update_summary(
@@ -1625,7 +1558,7 @@ class ContextStore:
         if corrected_from:
             metadata["category_corrected_from"] = corrected_from
 
-        self.collection.upsert(ids=[sid], documents=[document], metadatas=[metadata])
+        self.driver.put([{"id": sid, "document": document, "metadata": metadata}])
         return {
             "id": sid,
             "previous": previous_doc,
@@ -1658,23 +1591,23 @@ class ContextStore:
             category, corrected_from = _normalize_category(category)
         top_k = min(top_k, MAX_TOP_K)
 
-        where_clauses = []
+        filt: dict = {}
         if project:
-            where_clauses.append({"project": project})
+            filt["project"] = project
         if category:
-            where_clauses.append({"category": category})
+            filt["category"] = category
         if not include_retired:
-            where_clauses.append({"source": {"$ne": RETIRED_SOURCE}})
+            filt["exclude_sources"] = (RETIRED_SOURCE,)
 
-        where = None
-        if len(where_clauses) == 1:
-            where = where_clauses[0]
-        elif len(where_clauses) > 1:
-            where = {"$and": where_clauses}
-
-        results = self.collection.query(
-            query_texts=[query], n_results=top_k, where=where
-        )
+        hits = self.driver.similar(query, filt, top_k=top_k)
+        # Re-shaped into the nested form callers already consume — one list per
+        # query — so the driver seam is invisible above this method.
+        results = {
+            "ids": [[h["id"] for h in hits]],
+            "documents": [[h["document"] for h in hits]],
+            "metadatas": [[h["metadata"] for h in hits]],
+            "distances": [[h["distance"] for h in hits]],
+        }
 
         # Truncate long documents so one call can't dump unbounded tokens
         # into the conversation. Full content should live in a proper
