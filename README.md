@@ -43,34 +43,49 @@ tokens — then go only as deep as the task needs.
 
 Python 3.13. MCP server on the `mcp` SDK (streamable-HTTP, stateless), deployed
 to AWS Lambda (arm64) behind API Gateway, with Mangum adapting ASGI to Lambda
-events. Vectors in Chroma Cloud, embeddings from Voyage `voyage-3.5` over REST.
-Auth is Cognito OAuth 2.1, tokens verified locally against Cognito's JWKS.
-Credentials in Secrets Manager. CI is GitHub Actions over OIDC.
+events. Vectors in DynamoDB (its native vector search — `SearchVectors`),
+embeddings from Voyage `voyage-3.5` over REST. Auth is Cognito OAuth 2.1, tokens
+verified locally against Cognito's JWKS. Credentials in Secrets Manager. CI is
+GitHub Actions over OIDC.
+
+The store is selected at runtime: setting `DYNAMODB_TABLE` picks the DynamoDB
+driver, unsetting it falls back to Chroma (Cloud with the `CHROMA_*` trio
+configured, a local persist directory otherwise). Chroma remains installed and
+configured as the rollback path — reverting the backend is an environment
+change, not a redeploy. Table design: **[docs/dynamodb-schema.md](docs/dynamodb-schema.md)**.
 
 ## Running your own
 
 There is no hosted instance — this is bring-your-own-everything. You need an AWS
-account, a Chroma Cloud account, and a Voyage API key.
+account and a Voyage API key. (A Chroma Cloud account only if you run the Chroma
+backend instead of DynamoDB.)
 
 ### 1. Secrets
 
-Create a Secrets Manager secret (default id `context-mcp/credentials`) with
-**exactly** these four keys. `shared/config.py` raises at import if any is
-missing:
+Create a Secrets Manager secret (default id `context-mcp/credentials`).
+`shared/config.py` raises at cold start naming whatever is missing:
 
 ```
-VOYAGE_API_KEY
-CHROMA_TENANT
-CHROMA_DATABASE
+VOYAGE_API_KEY               # always required — DynamoDB stores vectors,
+                             # Voyage produces them
+CHROMA_TENANT                # required only when DYNAMODB_TABLE is unset
+CHROMA_DATABASE              # (the Chroma backend / rollback path)
 CHROMA_API_KEY
+MAP_CLIENT_SECRET            # optional — /map browser login; /map fails
+                             # closed without it
 ```
+
+Every key in the secret is loaded into the environment at cold start, so
+anything that must not sit in the function's configuration (which CI can read)
+belongs here.
 
 ### 2. Non-secret environment
 
-Six variables on the Lambda:
+Seven variables on the Lambda:
 
 ```
 CONTEXT_MCP_SECRET_ID        # the secret id above
+DYNAMODB_TABLE               # selects the DynamoDB store; unset = Chroma
 MCP_ALLOWED_HOST             # exact API Gateway hostname — "*" is compared
                              # literally and yields HTTP 421
 COGNITO_REGION
@@ -116,7 +131,9 @@ stores it — and takes a factory, so it can be pointed at a second backend and 
 passing run is that backend's proof. `shared/smoke.py` is the Chroma harness: it
 runs the contract, then Chroma's own engine tests (the embedding-function
 mismatch guard, local-fallback reopen), which assert things about the engine
-rather than about this store's semantics.
+rather than about this store's semantics. `shared/smoke_dynamodb.py` is the
+DynamoDB harness: the same contract against a throwaway table it creates and
+deletes (needs AWS credentials, no API keys).
 
 The entry point deliberately does **not** live in `shared/store.py`. Running that
 as `__main__` gives Python two copies of the module and two sets of exception
@@ -126,22 +143,21 @@ raised. `python -m shared.store` still works and just delegates.
 `requirements.txt` pulls full `chromadb`; the Lambda bundle uses
 `requirements-lambda.txt` with the thin `chromadb-client`, which exposes
 `PersistentClient` but raises "http-only client mode" if constructed. The bundle
-has a hard 250MB unzipped limit and currently sits at ~108MB.
+also carries its own `boto3` (~35MB): the runtime's copy predates DynamoDB's
+`SearchVectors` API, and that gap surfaced only in production — see the note in
+`requirements-lambda.txt`. The bundle has a hard 250MB unzipped limit and
+currently sits at ~110MB.
 
 ## Known gap: `/map` is not reproducible from infra
 
 The `/map` visualization reads three further variables — `MAP_CLIENT_ID`,
 `MAP_COGNITO_DOMAIN`, `MAP_CLIENT_SECRET` — and **nothing in `infra/setup.sh` or
-`.github/` sets any of them**. They are configured out of band, so a clean deploy
-brings up the MCP server correctly but leaves `/map` non-functional with no error
-explaining why.
-
-`MAP_CLIENT_SECRET` also breaks the project's own rule that only non-secret
-config lives in the environment: it is a client secret sitting outside Secrets
-Manager.
-
-Both are known and unfixed. Flagged here rather than omitted, because the failure
-is silent.
+`.github/` sets any of them**. In the live deployment all three sit in the
+Secrets Manager secret (every key there is loaded into the environment at cold
+start, so the client secret no longer lives in the function's configuration),
+but the Cognito app client they describe is created by hand. A clean deploy
+therefore brings up the MCP server correctly and leaves `/map` non-functional —
+it fails closed, with the reason visible only in the auth-rejection log.
 
 ## Scripts
 
@@ -153,3 +169,5 @@ against a live store at any time.
 Note that Chroma Cloud caps a single `get()` at 300 records and returns at most
 that many **silently** — any script walking the whole store must paginate, or it
 will confidently report on a subset. See `fetch_all()` in `audit_ids.py`.
+(DynamoDB has the same trap in a different shape: `Query` and `Scan` stop at
+1MB per page and signal it only via `LastEvaluatedKey`.)

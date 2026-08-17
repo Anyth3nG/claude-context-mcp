@@ -1,9 +1,15 @@
 # Context store schema
 
-Every entry written to ChromaDB (whether from backfill or a live `save_update`
+Every entry written to the store (whether from backfill or a live `save_update`
 call) carries this metadata. This is the contract every part of the system
 relies on — the backfill script, the MCP server's read/write tools, and any
 future visualization all read/write against this shape. Change it deliberately.
+
+The contract is backend-independent: it holds identically on DynamoDB (the
+deployed store, selected by `DYNAMODB_TABLE`) and on Chroma (local development
+and the rollback path), enforced by `shared/conformance.py` running against
+both. How the shape maps onto DynamoDB's keys and indexes is
+[dynamodb-schema.md](dynamodb-schema.md).
 
 ## Fields
 
@@ -50,13 +56,18 @@ a project's outstanding work — which genuinely belongs to a project — and
 `get_context` returns every summary for a project regardless of which group its
 category nominally sits in.
 
-## Collection structure in ChromaDB
+## Store layout
 
-Single collection, `context_store`, for everything — summaries, chunks,
-project-scoped, and general. Filtering happens via the `where` clause on
-metadata (`project`, `category`, `type`), not via separate collections.
-Keeping it one collection avoids needing to fan a query out across many
-collections later, and cross-project / project-agnostic queries stay simple.
+One store for everything — summaries, chunks, project-scoped, and general.
+Filtering happens via metadata (`project`, `category`, `type`), not via
+separate namespaces. Keeping it single avoids needing to fan a query out
+later, and cross-project / project-agnostic queries stay simple.
+
+On Chroma that is a single collection, `context_store`, filtered with `where`
+clauses. On DynamoDB it is a single table partitioned by project, with the
+record type encoded in the sort key — see
+[dynamodb-schema.md](dynamodb-schema.md) for how each access pattern maps to a
+query.
 
 ## Embedding model
 
@@ -73,10 +84,13 @@ This is enforced, not just documented: `ContextStore.__init__` raises
 `RuntimeError` if `VOYAGE_API_KEY` isn't set and no embedding function is
 explicitly provided — it will not silently fall back to the weaker local
 default. Opting out requires an explicit `allow_local_fallback=True`. The
-collection also remembers which embedding function created it (stored in
-collection metadata as `embedding_function_name`) and refuses to reopen with
-a different one, since mixing embedding spaces silently corrupts similarity
-search with no error otherwise. See `shared/store.py::VoyageRestEmbedding`.
+store also remembers which embedding function created it and refuses to
+reopen with a different one, since mixing embedding spaces silently corrupts
+similarity search with no error otherwise: Chroma stores
+`embedding_function_name` in collection metadata natively, and the DynamoDB
+driver replicates the guard with a reserved item checked at construction
+(`DynamoDriver.assert_embedding_space`). See
+`shared/store.py::VoyageRestEmbedding`.
 
 Voyage is called over its REST endpoint directly rather than through the
 `voyageai` SDK. Identical endpoint and vectors, but the SDK pulls in pillow,
@@ -209,9 +223,10 @@ Archiving is conditional on two independent triggers, tracked by an
   rewrite a document between checkpoints. A forced copy every N patches bounds
   that drift.
 
-Both are cheap because `_archive()` reuses the embedding Chroma already holds —
-the text is unchanged, so its vector is still exactly right and a checkpoint
-costs no Voyage call.
+Both are cheap because `_archive()` reuses the embedding the store already
+holds — the text is unchanged, so its vector is still exactly right and a
+checkpoint costs no Voyage call. (Both drivers honor a precomputed vector
+passed through `put()`.)
 
 ## Category enforcement
 
@@ -373,9 +388,10 @@ those are.
 Two things make that practical rather than merely advisable:
 
 - `save_chunks()` writes a whole list in ONE upsert, and therefore one embedding
-  call. Voyage bills and rate-limits per *request*, not per document, and Chroma
-  issues one embed call per upsert regardless of how many documents it carries —
-  so five focused chunks cost the same as one sprawling one. Without this,
+  call. Voyage bills and rate-limits per *request*, not per document, and both
+  drivers embed a whole `put()` batch in one call regardless of how many
+  documents it carries — so five focused chunks cost the same as one sprawling
+  one. Without this,
   splitting would trade a retrieval problem for five times the write latency and
   nobody would do it.
 - Writes that still exceed the cap come back flagged (`oversized`), at the
@@ -403,7 +419,7 @@ from having nobody to ask:
 - **Only past `SPLIT_THRESHOLD`** (`MAX_DOC_CHARS` × 1.10 = 1100). That buffer is
   `decisions/chunk-size-buffer` turned into a number: don't split to save a few
   characters. Below it, archiving behaves exactly as before — one entry, reusing
-  the vector Chroma already holds, **zero embedding cost**.
+  the vector the store already holds, **zero embedding cost**.
 - **One Voyage call when it does split.** The pieces are new texts, so the old
   vector no longer describes them and they must be embedded — but they go in one
   upsert, so it is one call regardless of piece count. Per-piece vectors are the

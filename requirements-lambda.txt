@@ -4,8 +4,9 @@
 # makes a plain zip deploy possible instead of a container image. Two choices
 # do most of that work:
 #   - chromadb-client, not chromadb: HTTP-only, so no embedded database engine
-#     and no onnxruntime (~51MB). The deployed path always talks to Chroma
-#     Cloud, so the local engine would be dead weight anyway.
+#     and no onnxruntime (~51MB). The deployed store is DynamoDB; Chroma is
+#     kept only as the rollback path, and that path talks to Chroma Cloud, so
+#     the local engine would be dead weight either way.
 #   - no voyageai: the SDK pulls pillow, tokenizers, hf_xet and aiohttp
 #     (~90MB) for features this project never touches. shared/store.py calls
 #     the same REST endpoint directly with httpx.
