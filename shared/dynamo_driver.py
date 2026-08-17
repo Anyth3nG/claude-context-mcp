@@ -44,6 +44,28 @@ GUARD_SK = "embedding"
 # DynamoDB caps a BatchWriteItem at 25 items.
 BATCH_LIMIT = 25
 
+# Every attribute a record item may carry, EXCEPT the embedding. Non-embedding
+# reads project exactly this set, because the alternative — fetching whole
+# items and discarding the vector client-side — moves and parses a 1024-float
+# list per record that the caller never asked for. That is what took the /map
+# page from milliseconds of data to a Lambda timeout: an atlas build reads
+# every record in the store, and the vectors were ~95% of the bytes.
+#
+# DynamoDB projections are include-only, so this list must be COMPLETE: an
+# attribute missing from it would silently vanish from projected reads. That
+# failure mode is why _item() refuses to write any attribute not listed here —
+# adding a new metadata field fails loudly at write time until this tuple
+# learns about it.
+KNOWN_ATTRIBUTES = (
+    "project", "sk", "id", "type_sk", "document", "chars", "searchable",
+    "category", "key", "type", "source", "timestamp", "tier",
+    "chat_title", "category_corrected_from", "backfilled",
+    "superseded_from", "superseded_at", "superseded_by", "superseded_reason",
+    "split_index", "split_count", "unarchived_patches",
+    "archived_reason", "retired_at", "retired_from_source", "retired_reason",
+)
+_WRITABLE_ATTRIBUTES = frozenset(KNOWN_ATTRIBUTES) | {"embedding"}
+
 # Attribute names DynamoDB reserves; any expression naming one needs an alias.
 _RESERVED = {"project", "type", "source", "key", "timestamp", "document"}
 
@@ -53,6 +75,16 @@ _deser = TypeDeserializer()
 
 def _alias(name: str) -> str:
     return f"#{name}" if name in _RESERVED else name
+
+
+def _projection_names() -> dict:
+    """
+    ExpressionAttributeNames for a non-embedding read: every known attribute,
+    each behind an alias. Aliasing all of them, not just the ones in _RESERVED,
+    because DynamoDB's reserved-word list runs to hundreds of entries and a
+    future attribute that happens to land on one would fail only at query time.
+    """
+    return {f"#pr{n}": attr for n, attr in enumerate(KNOWN_ATTRIBUTES)}
 
 
 def _plain(value):
@@ -158,6 +190,15 @@ class DynamoDriver:
             "chars": len(record["document"] or ""),
             "searchable": self._searchable(meta),
         }
+        unknown = set(item) - _WRITABLE_ATTRIBUTES
+        if unknown:
+            raise ValueError(
+                f"record would write attributes {sorted(unknown)} that are not in "
+                "KNOWN_ATTRIBUTES. Projected (non-embedding) reads return only "
+                "listed attributes, so an unlisted one would be stored but "
+                "silently absent from every scan/fetch. Add it to "
+                "KNOWN_ATTRIBUTES in shared/dynamo_driver.py."
+            )
         serialized = {k: _ser.serialize(v) for k, v in item.items()}
         # Built directly rather than through TypeSerializer, which refuses
         # floats outright ("use Decimal instead"). A vector is a list of N, and
@@ -266,11 +307,16 @@ class DynamoDriver:
     def fetch(self, ids: list[str], *, with_embeddings: bool = False) -> list[dict]:
         out = []
         for record_id in ids:
-            resp = self.ddb.query(
-                TableName=self.table, IndexName=GSI_BY_ID,
-                KeyConditionExpression="id = :i",
-                ExpressionAttributeValues={":i": _ser.serialize(record_id)},
-            )
+            kwargs = {
+                "TableName": self.table, "IndexName": GSI_BY_ID,
+                "KeyConditionExpression": "id = :i",
+                "ExpressionAttributeValues": {":i": _ser.serialize(record_id)},
+            }
+            if not with_embeddings:
+                names = _projection_names()
+                kwargs["ProjectionExpression"] = ", ".join(names)
+                kwargs["ExpressionAttributeNames"] = names
+            resp = self.ddb.query(**kwargs)
             for item in resp.get("Items") or []:
                 rec = self._record(item)
                 if not with_embeddings:
@@ -280,7 +326,7 @@ class DynamoDriver:
 
     def scan(self, filt: dict, *, with_documents: bool = True,
              with_embeddings: bool = False) -> list[dict]:
-        items = self._query(filt)
+        items = self._query(filt, with_embeddings=with_embeddings)
         recs = [self._record(i) for i in items]
         for r in recs:
             if not with_embeddings:
@@ -363,7 +409,7 @@ class DynamoDriver:
             return "superseded#"
         return None
 
-    def _query(self, filt: dict) -> list[dict]:
+    def _query(self, filt: dict, *, with_embeddings: bool = False) -> list[dict]:
         filt = dict(filt or {})
         # Fields consumed by the key condition must not be re-applied as a
         # filter on an attribute that may be absent (a keyless legacy chunk).
@@ -381,23 +427,26 @@ class DynamoDriver:
                 key_expr += " AND begins_with(sk, :skp)"
                 values[":skp"] = _ser.serialize(prefix)
             equality.pop("project", None)
-            return self._run(None, key_expr, names, values, equality, exclude)
+            return self._run(None, key_expr, names, values, equality, exclude,
+                             with_embeddings=with_embeddings)
 
         if filt.get("type") is not None:
             key_expr = "#t = :t"
             names = {"#t": "type"}
             values = {":t": _ser.serialize(filt["type"])}
             equality.pop("type", None)
-            return self._run(GSI_BY_TYPE, key_expr, names, values, equality, exclude)
+            return self._run(GSI_BY_TYPE, key_expr, names, values, equality, exclude,
+                             with_embeddings=with_embeddings)
 
         # No project and no type: walk both type partitions rather than Scan.
         out = []
         for record_type in ("summary", "chunk"):
-            out.extend(self._query({**filt, "type": record_type}))
+            out.extend(self._query({**filt, "type": record_type},
+                                   with_embeddings=with_embeddings))
         return out
 
     def _run(self, index: Optional[str], key_expr: str, names: dict, values: dict,
-             equality: dict, exclude: tuple) -> list[dict]:
+             equality: dict, exclude: tuple, *, with_embeddings: bool = False) -> list[dict]:
         conditions = []
         for n, (field, value) in enumerate(equality.items()):
             names[f"#e{n}"] = field
@@ -418,6 +467,10 @@ class DynamoDriver:
             "ExpressionAttributeNames": names,
             "ExpressionAttributeValues": values,
         }
+        if not with_embeddings:
+            projection = _projection_names()
+            kwargs["ProjectionExpression"] = ", ".join(projection)
+            names.update(projection)
         if index:
             kwargs["IndexName"] = index
         if conditions:
