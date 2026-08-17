@@ -34,6 +34,8 @@ Use add_update for point-in-time facts that ACCUMULATE: a decision made, an even
 
 Use patch_context INSTEAD when revising the CURRENT STATE of something that already has a value. Appending a corrected version here leaves the outdated one in place, and future sessions must then read both and guess which still holds.
 
+Pass `key` when the fact clearly belongs to one sub-topic — it files the entry alongside that slot's history instead of loose in the category. Unlike a summary key it is ungated: the key need not already have a summary, and coining a new one is fine. Omit it rather than guessing; a wrong key is worse than none.
+
 Save when: a real decision gets made, the user states a lasting preference or fact about themselves, or sets or updates a task.
 
 Do NOT save: hypotheticals or options weighed but not chosen, restatements of something already in THIS store (check with search_context), transient debugging detail, or anything you're unsure is worth surfacing again. When in doubt, don't — a missed save is cheap to redo; a bad save pollutes retrieval permanently."""
@@ -67,6 +69,17 @@ def add_update(
             "Required if project is set, omitted otherwise."
         ),
     ] = None,
+    key: Annotated[
+        Optional[str],
+        Field(
+            description="Optional sub-topic this belongs under, e.g. 'rotation' under config. "
+            "File a fact under the key it is about when you know it — it groups the entry with "
+            "that slot's history and keeps identical text under different keys from collapsing "
+            "into one entry. Unlike a summary key this is NOT gated: the key does not need to "
+            "have a summary yet, and coining a new one is fine. Omit it if the material does not "
+            "clearly belong to one topic; a wrong key is worse than none."
+        ),
+    ] = None,
 ) -> dict:
     store = get_store()
     documents = [content] if isinstance(content, str) else list(content)
@@ -77,6 +90,7 @@ def add_update(
         project=project,
         tier=tier,
         source="live",
+        key=key,
     )
 
     for chunk_id, document in zip(result["ids"], documents):
@@ -85,18 +99,29 @@ def add_update(
                 "id": chunk_id,
                 "project": result["project"],
                 "category": result["category"],
+                "key": result.get("key"),
                 "corrected_from": result.get("corrected_from"),
                 "tier": result.get("tier"),
                 "content": document,
             }
         )
 
+    # Name the destination in full. This used to return only {added, ids, count,
+    # category}, so a caller could not tell from the response WHERE its write
+    # landed — which is how a write aimed at one slot went somewhere else and
+    # nobody noticed until the entry could not be found again.
+    stored_at = f"{result['project']}/{result['category']}"
+    if result.get("key"):
+        stored_at += f"/{result['key']}"
     response: dict = {
         "added": True,
+        "stored_at": stored_at,
         "ids": result["ids"],
         "count": result["count"],
         "category": result["category"],
     }
+    if result.get("key"):
+        response["key"] = result["key"]
     if result["duplicates_collapsed"]:
         response["duplicates_collapsed"] = result["duplicates_collapsed"]
         response["duplicate_note"] = (
