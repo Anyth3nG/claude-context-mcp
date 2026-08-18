@@ -59,6 +59,43 @@ MAX_DOC_CHARS = 1000
 SPLIT_BUFFER_RATIO = 1.10
 SPLIT_THRESHOLD = int(MAX_DOC_CHARS * SPLIT_BUFFER_RATIO)
 
+
+def _search_visibility(document: str, previous_doc: Optional[str] = None) -> Optional[dict]:
+    """
+    What a write costs the slot in SEARCH visibility, or None when it costs
+    nothing.
+
+    save_chunks has reported this since chunks existed, as `oversized`. Summary
+    writes never did, which is precisely backwards: a chunk is written once and
+    cannot grow, while a summary is the only record that CAN, and patching only
+    ever adds — nothing in the write path ever removes a passage. So the one
+    record type that drifts past the clip was the one with no feedback on it.
+
+    Measured live before this existed: 23 of 100 slots sat over MAX_DOC_CHARS,
+    holding 24k characters that search_context could not show. The worst had gone
+    1022 -> 6477 across four versions, and its replacement — written the same
+    afternoon, deliberately, by someone who had just diagnosed the problem —
+    still came out at 1804. Judgement alone does not hold a line it cannot see,
+    which is the entire argument for returning the number.
+
+    Note this is about SEARCH only. get_context returns the slot whole at any
+    length; what a long slot loses is discoverability by anyone who does not
+    already know its address.
+    """
+    if len(document) <= MAX_DOC_CHARS:
+        return None
+    return {
+        "chars": len(document),
+        "search_clips_at": MAX_DOC_CHARS,
+        "hidden_from_search": len(document) - MAX_DOC_CHARS,
+        # Distinguishes "this write caused it" from "this slot was already
+        # over" — the same warning on every subsequent patch would otherwise
+        # read as noise rather than as a consequence of what just happened.
+        # No previous document means the slot is being created, so a first
+        # write landing over the clip crossed it too.
+        "crossed_now": len(previous_doc or "") <= MAX_DOC_CHARS,
+    }
+
 # How close a typo must be to auto-correct (0-1, difflib ratio).
 CATEGORY_MATCH_CUTOFF = 0.75
 
@@ -1312,6 +1349,7 @@ class ContextStore:
             "chars_before": len(previous_doc),
             "chars_after": len(patched),
             "delta": len(patched) - len(previous_doc),
+            "oversized": _search_visibility(patched, previous_doc),
             "archived_id": archived_id,
             "archived_split_into": len(archived_ids) if archived_ids and len(archived_ids) > 1 else None,
             "corrected_from": corrected_from,
@@ -1599,6 +1637,7 @@ class ContextStore:
         return {
             "id": sid,
             "previous": previous_doc,
+            "oversized": _search_visibility(document, previous_doc),
             "archived_id": archived_id,
             "archived_split_into": len(archived_ids) if archived_ids and len(archived_ids) > 1 else None,
             "corrected_from": corrected_from,

@@ -730,4 +730,39 @@ def run(make_store) -> None:
     assert "revision r8," in store.get_summary("ryw", "config", key="probe")[0]
     print("  8 chained patches, each read back immediately, no stale version served.")
 
+    print("\n=== A summary write reports what it costs in search visibility ===")
+    # The store's own norm, applied to the record type that can actually breach
+    # it. save_chunks has always reported `oversized`; summary writes did not,
+    # which is backwards — a chunk is written once and cannot grow, a summary is
+    # the only record that does, and patching only ever adds.
+    small = "Short enough to stay wholly visible to search. " * 4
+    res = store.update_summary(small, category="note", project="sizetest",
+                               tier="personal", key="probe", create_key=True)
+    assert res["oversized"] is None, "a slot under the clip must report nothing"
+
+    # Crossing it: caused by THIS write, so it must say so.
+    # Ends in a unique marker so the patch below can name one place: a fixture
+    # of one repeated character makes every short old_str ambiguous.
+    big = "x" * (MAX_DOC_CHARS + 250 - len("ENDCAP")) + "ENDCAP"
+    res = store.update_summary(big, category="note", project="sizetest",
+                               tier="personal", key="probe")
+    over = res["oversized"]
+    assert over and over["hidden_from_search"] == 250, over
+    assert over["crossed_now"] is True, "the write that crossed the clip must own it"
+
+    # Already over: still reported, but not blamed on this write — otherwise
+    # every later patch reads as a fresh alarm and the signal becomes noise.
+    res = store.patch_summary(old_str="ENDCAP", new_str="ENDCAP" + "y" * 30,
+                              category="note", project="sizetest", key="probe")
+    assert res["oversized"]["crossed_now"] is False, (
+        "a patch to a slot that was ALREADY over must not claim to have caused it"
+    )
+    assert res["oversized"]["chars"] == res["chars_after"]
+
+    # Back under, and the signal goes away rather than latching.
+    res = store.update_summary(small, category="note", project="sizetest",
+                               tier="personal", key="probe", allow_shrink=True)
+    assert res["oversized"] is None, "condensing below the clip must clear the signal"
+    print(f"  reported crossing, staying over, and clearing, against a {MAX_DOC_CHARS}-char clip.")
+
     print("\nContract satisfied.")

@@ -37,6 +37,35 @@ from shared.store import (
 from mcp_server.context import get_store
 from mcp_server.review_log import log_write
 
+
+def _apply_oversized(response: dict, result: dict) -> None:
+    """
+    Attach the search-visibility cost of this write, when there is one.
+
+    Said at write time, in the response, because that is the only moment the
+    writer is still holding the material and can split it. Discovered later it
+    is not actionable — it looks like a search that simply did not find much.
+    Mirrors add_update's `oversized`, deliberately using the same key name so
+    both write tools report the same condition in the same words.
+    """
+    over = result.get("oversized")
+    if not over:
+        return
+    response["oversized"] = over
+    lead = (
+        "This write took the slot past the search clip. "
+        if over["crossed_now"] else
+        "This slot was already past the search clip. "
+    )
+    response["oversized_note"] = (
+        f"{lead}It is now {over['chars']} characters; search_context returns at most "
+        f"{over['search_clips_at']}, so {over['hidden_from_search']} are invisible to "
+        "search — get_context still returns it whole, so what is lost is "
+        "discoverability by anyone who does not already know the address. If the slot "
+        "now covers several topics, split it into sub-keys rather than condensing; if "
+        "it narrates when things changed, that material belongs in add_update."
+    )
+
 DESCRIPTION = """Write a summary slot — the current state of one topic. THIS IS THE DEFAULT WAY TO UPDATE STORED CONTEXT.
 
 Two shapes, chosen by whether you pass `old_str`:
@@ -45,7 +74,11 @@ PATCH — pass `old_str` and `new_str`. Changes one passage and leaves everythin
 
 WHOLESALE — pass `content` and omit `old_str`. Replaces the slot entirely, or creates it if it does not exist yet. `content` must be the COMPLETE new state, not a fragment — whatever was stored is replaced, so sending only the changed part destroys the rest. A replacement under half the stored length is refused unless you pass `allow_shrink=true`, and opening a NEW key in a category that already has slots needs `create_key=true`.
 
-Use add_update INSTEAD for point-in-time facts that should accumulate — a decision made, an event, something discovered. Those belong in history, not in a slot that gets overwritten.
+Use add_update INSTEAD for point-in-time facts that should accumulate — a decision made, an event, something discovered. Those belong in history, not in a slot that gets overwritten. This is the single most common way a slot bloats: a summary that narrates WHEN things changed is carrying history in the wrong place, and unlike history it is never cleaned up.
+
+KEEP A SLOT UNDER 1000 CHARACTERS. That is not style — search_context clips every result at exactly 1000, so the remainder of a longer slot is invisible to anyone who does not already know its address. Length should follow the job: a reminder is 300-500, a decision worth defending later around 800, a design analysis someone will act from up to 1500. A write over the clip comes back with `oversized` saying how much is hidden.
+
+WHEN A SLOT OUTGROWS THE LIMIT, SPLIT IT RATHER THAN COMPRESS IT. Slots are addressed by category AND key, so one sprawling entry is usually several topics sharing an address — two 900-character slots are fully searchable where one 1800-character slot is half-searchable. Compression loses content; splitting does not. Patching only ever adds text, so nothing else in this tool will ever bring a slot back down.
 
 Every refusal returns the current stored text, so read it and retry against what is actually there. The previous value is archived on any write that replaces enough of it, so a bad overwrite is recoverable through get_history."""
 
@@ -219,6 +252,7 @@ def patch_context(
         )
     if result.get("archived_split_into"):
         response["archived_split_into"] = result["archived_split_into"]
+    _apply_oversized(response, result)
     if result.get("corrected_from"):
         response["category_note"] = (
             f"'{result['corrected_from']}' isn't a valid category — used '{result['category']}'."
@@ -317,6 +351,7 @@ def _wholesale(store, content, category, project, key, tier, allow_shrink, creat
         )
     if result.get("archived_split_into"):
         response["archived_split_into"] = result["archived_split_into"]
+    _apply_oversized(response, result)
     if result.get("corrected_from"):
         response["category_note"] = (
             f"'{result['corrected_from']}' isn't a valid category — used '{result['category']}'."
