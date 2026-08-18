@@ -1,10 +1,14 @@
 """
-Thin wrapper around ChromaDB implementing the schema in docs/schema.md.
-Single collection, metadata-filtered queries. This is the module both
-the MCP server and the backfill script will import — logic lives here once.
+The store's semantics, implementing the schema in docs/schema.md. This is the
+module both the MCP server and the scripts import — logic lives here once.
+
+Storage is reached through a StorageDriver (shared/drivers.py); the deployed
+backend is DynamoDB, described in docs/dynamodb-schema.md. The Chroma
+construction below is what remains of the original backend: no longer deployed
+and no longer a rollback target, but kept runnable locally so the contract in
+shared/conformance.py still has a second backend to prove itself against.
 """
 from __future__ import annotations
-import chromadb
 import hashlib
 import httpx
 import numpy as np
@@ -473,11 +477,15 @@ def _make_client(persist_path: str, use_cloud: Optional[bool] = None):
     misconfigured, and silently writing to a local disk instead would look
     like it worked while the entries went nowhere anyone else can read.
 
-    NOTE: PersistentClient requires the full `chromadb` package. The Lambda
-    bundle installs `chromadb-client`, which exposes the name but raises
-    "http-only client mode" on construction — so the deployed path must always
-    resolve to Cloud. See requirements.txt vs requirements-lambda.txt.
+    NOTE: chromadb is imported HERE rather than at module scope, and that is
+    load-bearing rather than stylistic. Since the DynamoDB cutover the deployed
+    bundle carries no chromadb at all, so a module-level import would make
+    shared.store unimportable in Lambda — every request, not just a Chroma one.
+    Deferring it means the dependency is paid only by a caller that actually
+    asks for a Chroma-backed store, which is now local development alone.
     """
+    import chromadb
+
     tenant = os.environ.get("CHROMA_TENANT")
     database = os.environ.get("CHROMA_DATABASE")
     api_key = os.environ.get("CHROMA_API_KEY")

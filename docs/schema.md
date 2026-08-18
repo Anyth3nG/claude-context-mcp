@@ -7,8 +7,8 @@ future visualization all read/write against this shape. Change it deliberately.
 
 The contract is backend-independent: it holds identically on DynamoDB (the
 deployed store, selected by `DYNAMODB_TABLE`) and on Chroma (local development
-and the rollback path), enforced by `shared/conformance.py` running against
-both. How the shape maps onto DynamoDB's keys and indexes is
+only — retired as a backend, kept as the second implementation the contract is
+proved against), enforced by `shared/conformance.py` running against both. How the shape maps onto DynamoDB's keys and indexes is
 [dynamodb-schema.md](dynamodb-schema.md).
 
 ## Fields

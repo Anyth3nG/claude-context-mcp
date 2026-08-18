@@ -48,17 +48,18 @@ embeddings from Voyage `voyage-3.5` over REST. Auth is Cognito OAuth 2.1, tokens
 verified locally against Cognito's JWKS. Credentials in Secrets Manager. CI is
 GitHub Actions over OIDC.
 
-The store is selected at runtime: setting `DYNAMODB_TABLE` picks the DynamoDB
-driver, unsetting it falls back to Chroma (Cloud with the `CHROMA_*` trio
-configured, a local persist directory otherwise). Chroma remains installed and
-configured as the rollback path — reverting the backend is an environment
-change, not a redeploy. Table design: **[docs/dynamodb-schema.md](docs/dynamodb-schema.md)**.
+The store is reached through a driver seam (`shared/drivers.py`), so the rules
+are written once and the backend is chosen by configuration: `DYNAMODB_TABLE`
+picks DynamoDB. Chroma was the original backend and is retired — out of the
+deployed bundle and out of the secret — but the driver and its harness are kept
+runnable locally, because a contract that only ever runs against one backend is
+not a contract. Table design:
+**[docs/dynamodb-schema.md](docs/dynamodb-schema.md)**.
 
 ## Running your own
 
 There is no hosted instance — this is bring-your-own-everything. You need an AWS
-account and a Voyage API key. (A Chroma Cloud account only if you run the Chroma
-backend instead of DynamoDB.)
+account and a Voyage API key.
 
 ### 1. Secrets
 
@@ -66,11 +67,8 @@ Create a Secrets Manager secret (default id `context-mcp/credentials`).
 `shared/config.py` raises at cold start naming whatever is missing:
 
 ```
-VOYAGE_API_KEY               # always required — DynamoDB stores vectors,
+VOYAGE_API_KEY               # required — DynamoDB stores vectors,
                              # Voyage produces them
-CHROMA_TENANT                # required only when DYNAMODB_TABLE is unset
-CHROMA_DATABASE              # (the Chroma backend / rollback path)
-CHROMA_API_KEY
 MAP_CLIENT_SECRET            # optional — /map browser login; /map fails
                              # closed without it
 ```
@@ -85,7 +83,7 @@ Seven variables on the Lambda:
 
 ```
 CONTEXT_MCP_SECRET_ID        # the secret id above
-DYNAMODB_TABLE               # selects the DynamoDB store; unset = Chroma
+DYNAMODB_TABLE               # the store's table; unset fails at startup
 MCP_ALLOWED_HOST             # exact API Gateway hostname — "*" is compared
                              # literally and yields HTTP 421
 COGNITO_REGION
@@ -140,16 +138,16 @@ as `__main__` gives Python two copies of the module and two sets of exception
 classes, so `except PatchNoMatch` stops catching the `PatchNoMatch` that was
 raised. `python -m shared.store` still works and just delegates.
 
-`requirements.txt` pulls full `chromadb`; the Lambda bundle uses
-`requirements-lambda.txt` with the thin `chromadb-client`, which exposes
-`PersistentClient` but raises "http-only client mode" if constructed. The bundle
-also carries its own `boto3` (~35MB): the runtime's copy predates DynamoDB's
-`SearchVectors` API, and that gap surfaced only in production — see the note in
-`requirements-lambda.txt`. The bundle has a hard 250MB unzipped limit and
-currently sits at ~128MB unzipped / ~50MB zipped. The zipped figure is the one
-to watch: it is within a few percent of the ~52MB direct-upload cap, and
-crossing it breaks the deploy, not the runtime. Dropping `chromadb-client`
-once the Chroma rollback path retires buys the headroom back.
+`requirements.txt` pulls full `chromadb` for local work; the Lambda bundle uses
+`requirements-lambda.txt`, which no longer carries any Chroma client at all —
+`shared/store.py` imports `chromadb` lazily, inside the only function that
+constructs one, so the deployed path never touches it. The bundle does carry its
+own `boto3` (~35MB): the runtime's copy predates DynamoDB's `SearchVectors` API,
+and that gap surfaced only in production — see the note in
+`requirements-lambda.txt`. Limits are 250MB unzipped and 52,428,800 bytes zipped
+for a direct upload; the bundle sits at ~112MB / ~40MB, and CI guards both.
+Zipped is the one that binds — it was within ~2MB of its cap before dropping
+`chromadb-client`, which took 16 transitive packages with it.
 
 ## Known gap: `/map` is not reproducible from infra
 

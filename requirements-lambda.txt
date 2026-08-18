@@ -1,12 +1,12 @@
 # Deployment bundle only — keep this list minimal.
 #
-# Lambda allows 250MB unzipped; this set lands around 110MB, which is what
-# makes a plain zip deploy possible instead of a container image. Two choices
-# do most of that work:
-#   - chromadb-client, not chromadb: HTTP-only, so no embedded database engine
-#     and no onnxruntime (~51MB). The deployed store is DynamoDB; Chroma is
-#     kept only as the rollback path, and that path talks to Chroma Cloud, so
-#     the local engine would be dead weight either way.
+# Lambda allows 250MB unzipped and 52,428,800 bytes (50MiB) for a direct zip
+# upload. The zipped figure is the one that binds, and .github/workflows/deploy.yml
+# guards both. Two choices do most of the work of staying under them:
+#   - no chromadb: the store is DynamoDB, and since the rollback path retired
+#     there is no reason to ship a second backend's client. Removing it took 16
+#     transitive packages with it — grpcio, protobuf, the opentelemetry stack,
+#     PyYAML, orjson — and about 30MB unzipped.
 #   - no voyageai: the SDK pulls pillow, tokenizers, hf_xet and aiohttp
 #     (~90MB) for features this project never touches. shared/store.py calls
 #     the same REST endpoint directly with httpx.
@@ -18,14 +18,18 @@
 #
 # Do NOT strip .dist-info directories from the bundle to save space —
 # importlib.metadata reads them at runtime and imports fail without them.
-chromadb-client
 httpx
 numpy
 mcp
 mangum
-# Cognito access-token verification. cryptography (needed for RS256) already
-# comes in via chromadb-client's dependency chain, so this adds very little.
+
+# Cognito access-token verification.
 PyJWT
+# RS256 needs it, and PyJWT does not declare it — it is an extra. This used to
+# arrive transitively through chromadb-client and was written down as such;
+# dropping that package made a security-critical dependency depend on whatever
+# else happened to pull it in. Named here so it is chosen rather than inherited.
+cryptography
 
 # boto3, which the Lambda runtime ALSO provides — but the runtime's copy predates
 # DynamoDB's SearchVectors API and therefore cannot do vector search. That failed
@@ -34,9 +38,6 @@ PyJWT
 # raised "'DynamoDB' object has no attribute 'search_vectors'". Local testing
 # could not catch it, having installed a current boto3 in the dev venv.
 #
-# ~35MB unzipped, almost all of it botocore's service models. The bundle sits at
-# ~128MB unzipped against the 250MB limit — but ~50MB ZIPPED, within a few
-# percent of the ~52MB direct-upload cap, so the next sizeable dependency breaks
-# the deploy rather than the runtime. Dropping chromadb-client when the Chroma
-# rollback path retires buys the headroom back.
+# ~35MB unzipped, almost all of it botocore's service models — now the largest
+# thing in the bundle by a wide margin.
 boto3

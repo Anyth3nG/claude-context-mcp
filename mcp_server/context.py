@@ -1,7 +1,6 @@
 """
 Shared ContextStore instance for the MCP server's tools — one process, one
-ChromaDB connection, so search_context and save_update aren't each opening
-their own client.
+backend connection, so the tools aren't each opening their own client.
 """
 from __future__ import annotations
 import os
@@ -38,11 +37,14 @@ def get_store() -> ContextStore:
         # 1 in any test that drives the tools.
         table = os.environ.get("DYNAMODB_TABLE")
         if table:
-            # DynamoDB is selected by configuration, not by a code edit, so a
-            # rollback is an environment change rather than a redeploy: unset
-            # DYNAMODB_TABLE and the Chroma path below is live again. Chroma is
-            # deliberately left installed and configured until the new backend
-            # has run long enough to trust.
+            # The backend is still chosen by configuration rather than by a code
+            # edit, but this is no longer a rollback switch. Chroma has been
+            # retired: its credentials are out of the secret and chromadb is out
+            # of the deployed bundle, so unsetting DYNAMODB_TABLE in Lambda now
+            # fails at startup (shared/config.py says so in as many words)
+            # instead of quietly serving a stale store. The branch below survives
+            # for local development, where chromadb is still installed and the
+            # contract in shared/conformance.py runs against both backends.
             from shared.dynamo_driver import DynamoDriver
             from shared.store import DEFAULT_VOYAGE_MODEL, VoyageRestEmbedding
 
