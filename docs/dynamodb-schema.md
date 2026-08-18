@@ -177,7 +177,7 @@ limit. Billing is `PAY_PER_REQUEST` — vector indexes support on-demand only.
 Every read is a `GetItem` or a `Query`. **No `Scan` anywhere**, which was the
 substance of the argument for moving.
 
-### The one row above that needed a driver change to be true
+### Two rows above that needed a change to be true
 
 `get_summary` is specified as a strongly consistent `GetItem` on PK/SK, and the
 port did not deliver that. `StorageDriver.fetch()` is **id-based**, and ids are
@@ -199,6 +199,23 @@ the collection, not an index), DynamoDB uses the components for a base-table
 `GetItem` with `ConsistentRead=True`. `shared/conformance.py` now asserts
 read-your-writes on both backends.
 
+`slot_history` was the second, and it cost latency rather than correctness.
+The row above specifies one partition query on
+`begins_with(sk, "superseded#{cat}#{key}#")`; the store instead asked
+`records(superseded_from=sid)`, which is exact but names no partition — so
+`_query` had nothing to narrow with and walked BOTH type partitions of `by_type`
+per slot, paginating as it filtered. 144 index queries to return 475 items. The
+atlas asks every slot for its history at once, which put `/map` back into the
+Lambda timeout on 2026-08-18.
+
+The prefix planner already knew how to build the right key condition; the
+components simply never reached it, for the same reason as above — the neutral
+filter vocabulary is portable precisely because it says nothing about
+partitions, which is exactly what a partitioned store needs to be told. This is
+the change item 3 below asked for, and passing the components narrows without
+loosening: `superseded_from` still decides which records match. Verified equal
+on all 100 live slots. Atlas build 16.8s -> 7.0s, 187 round trips -> 79.
+
 **Still open, and deliberately:** this closes the staleness window, not the
 lost-update race. `patch_summary` reads, computes and overwrites unconditionally,
 so two concurrent writers can still clobber one another even with perfect reads —
@@ -213,9 +230,11 @@ it would be a guarantee only one backend provides.
 2. **`searchable` is written on every item.** Derived from `source`, but stored,
    because the filter grammar cannot compute it.
 3. **`records(superseded_from=sid)` should take components instead.**
-   `shared/conformance.py` calls it with a raw sid, which would force id parsing.
-   Change it to `records(project=…, category=…, key=…, source="superseded")` —
-   one call site, and it is more honest about what it is asking for.
+   Done for `slot_history` on 2026-08-18, after the unnarrowed version timed out
+   `/map` — see above. `shared/conformance.py` still calls it with a raw sid,
+   which is left deliberately: it is the one place that exercises the
+   unnarrowed filter, and that path must stay correct even though nothing in
+   production should now take it.
 
 ## Pagination, for free
 
