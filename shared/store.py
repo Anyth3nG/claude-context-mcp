@@ -932,7 +932,19 @@ class ContextStore:
         category, corrected_from = _normalize_category(category)
         key = _normalize_key(key)
         sid = self.summary_id(project, category, key)
-        found = self.driver.scan({"superseded_from": sid})
+        # superseded_from alone would be correct and ruinously slow. It names no
+        # partition, so a backend that keys on one has nothing to narrow with and
+        # must sweep everything, filtering as it goes — on DynamoDB that was two
+        # paginated index queries per slot, and the atlas asks for every slot at
+        # once, which is what pushed /map into the Lambda timeout. The natural key
+        # says WHERE the archives live; superseded_from still says WHICH they are,
+        # so this narrows without loosening. Verified equal on all 100 live slots.
+        found = self.driver.scan({
+            "project": project or "general",
+            "category": category,
+            "key": key,
+            "superseded_from": sid,
+        })
         # An oversized version was archived as several pieces (see
         # _split_for_archive), and one archival event is ONE version of the slot,
         # not three. Group by superseded_at — every piece of a single _archive
