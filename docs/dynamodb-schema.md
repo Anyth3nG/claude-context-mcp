@@ -157,7 +157,7 @@ limit. Billing is `PAY_PER_REQUEST` — vector indexes support on-demand only.
 
 | contract method | operation |
 |---|---|
-| `get_summary` | `GetItem` PK=project, SK=`summary#{cat}#{key}`, strongly consistent |
+| `get_summary` | `GetItem` PK=project, SK=`summary#{cat}#{key}`, strongly consistent — via `fetch_slot`, see below |
 | `get_brief(p)` | `Query` PK=p, `begins_with(sk, "summary#")` |
 | `get_brief(p, cat)` | `Query` PK=p, `begins_with(sk, "summary#{cat}#")` |
 | `summary_keys` | same as above, project the key |
@@ -176,6 +176,35 @@ limit. Billing is `PAY_PER_REQUEST` — vector indexes support on-demand only.
 
 Every read is a `GetItem` or a `Query`. **No `Scan` anywhere**, which was the
 substance of the argument for moving.
+
+### The one row above that needed a driver change to be true
+
+`get_summary` is specified as a strongly consistent `GetItem` on PK/SK, and the
+port did not deliver that. `StorageDriver.fetch()` is **id-based**, and ids are
+opaque here by design (PK/SK come from metadata, never from parsing an id), so
+the only way to resolve one was a `Query` on `by_id` — a GSI, where DynamoDB
+refuses `ConsistentRead` outright, since indexes are maintained asynchronously
+after the base-table write returns.
+
+That gap is not cosmetic. `patch_summary` reads the slot, matches `old_str`
+against what came back, derives the archive copy and the patch counter from it,
+then writes the result. A read served from inside the propagation window is
+computed against superseded text on which every refusal still passes, so the
+intervening edit is discarded silently — and `chars_before`/`chars_after`/`delta`
+cannot reveal it, being measured from that same stale read.
+
+Closed 2026-08-18 by adding an eighth driver method, `fetch_slot`, which takes
+the id **and** the natural-key components: Chroma uses the id (its `get()` reads
+the collection, not an index), DynamoDB uses the components for a base-table
+`GetItem` with `ConsistentRead=True`. `shared/conformance.py` now asserts
+read-your-writes on both backends.
+
+**Still open, and deliberately:** this closes the staleness window, not the
+lost-update race. `patch_summary` reads, computes and overwrites unconditionally,
+so two concurrent writers can still clobber one another even with perfect reads —
+which matters because multi-client is the premise of the system. Closing it needs
+a `ConditionExpression` on the write, and Chroma has no equivalent primitive, so
+it would be a guarantee only one backend provides.
 
 ## Three changes this forces in the store's own contract
 
