@@ -847,11 +847,17 @@ class ContextStore:
         """
         category, _ = _normalize_category(category)
         key = _normalize_key(key)
-        found = self.driver.fetch([self.summary_id(project, category, key)],
-                                  with_embeddings=with_embedding)
-        if not found:
+        # fetch_slot, not fetch: this read is the basis of every read-modify-write
+        # in the store (patch, replace, archive), so it must return the caller's
+        # own last write. See StorageDriver.fetch_slot for why an id lookup alone
+        # cannot promise that on every backend.
+        rec = self.driver.fetch_slot(
+            self.summary_id(project, category, key),
+            project=project, category=category, key=key,
+            with_embeddings=with_embedding,
+        )
+        if rec is None:
             return None
-        rec = found[0]
         return (rec["document"], rec["metadata"], rec.get("embedding"))
 
     def get_brief(

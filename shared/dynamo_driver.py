@@ -149,10 +149,21 @@ class DynamoDriver:
 
     # ---- addressing ------------------------------------------------------
     @staticmethod
+    def _summary_sk(category: Optional[str], key: Optional[str]) -> str:
+        """
+        A summary's sort key, from its natural key components.
+
+        Factored out because it is now built in two places — when writing an
+        item, and when reading one back by natural key — and the two silently
+        disagreeing would turn every consistent read into a miss.
+        """
+        return f"summary#{category or '_'}#{key or '_'}"
+
+    @staticmethod
     def _sort_key(record_id: str, meta: dict) -> str:
         category = meta.get("category") or "_"
         if meta.get("type") == "summary":
-            return f"summary#{category}#{meta.get('key') or '_'}"
+            return DynamoDriver._summary_sk(category, meta.get("key"))
         # A superseded copy sorts under its ORIGIN slot, then by its own id.
         #
         # The id and NOT superseded_at, which is what an earlier version used.
@@ -323,6 +334,45 @@ class DynamoDriver:
                     rec.pop("embedding", None)
                 out.append(rec)
         return out
+
+    def fetch_slot(self, record_id: str, *, project: Optional[str], category: str,
+                   key: Optional[str],
+                   with_embeddings: bool = False) -> Optional[dict]:
+        """
+        Read one summary slot by its NATURAL KEY, strongly consistently.
+
+        Not fetch(): that resolves an id through the by_id GSI, and DynamoDB
+        refuses ConsistentRead on any global secondary index ("Consistent reads
+        are not supported on global secondary indexes"), because an index is
+        maintained asynchronously after the base-table write returns. A summary
+        read that lands inside that window returns the previous version, and
+        patch_summary derives its match, its archive copy and its patch counter
+        from it — so the write that follows silently discards whatever landed in
+        between, while every built-in check still passes.
+
+        The components sidestep the index entirely: PK and SK are exactly what a
+        summary item is stored under, so this is a GetItem on the base table,
+        where ConsistentRead is available and read-your-writes holds.
+        """
+        kwargs = {
+            "TableName": self.table,
+            "Key": {
+                "project": _ser.serialize(project or "general"),
+                "sk": _ser.serialize(self._summary_sk(category, key)),
+            },
+            "ConsistentRead": True,
+        }
+        if not with_embeddings:
+            names = _projection_names()
+            kwargs["ProjectionExpression"] = ", ".join(names)
+            kwargs["ExpressionAttributeNames"] = names
+        item = self.ddb.get_item(**kwargs).get("Item")
+        if not item:
+            return None
+        rec = self._record(item)
+        if not with_embeddings:
+            rec.pop("embedding", None)
+        return rec
 
     def scan(self, filt: dict, *, with_documents: bool = True,
              with_embeddings: bool = False) -> list[dict]:

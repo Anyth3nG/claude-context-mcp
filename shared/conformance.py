@@ -701,5 +701,33 @@ def run(make_store) -> None:
         "an unsplit archive must carry no split bookkeeping at all"
     print("  an unsplit archive stays exactly as before, no split metadata added.")
 
+    print("\n=== A slot read returns the caller's own last write ===")
+    # Read-your-writes, asserted because a backend can violate it SILENTLY.
+    # patch_summary reads the slot, matches old_str against what came back,
+    # derives the archive copy and the patch counter from it, and writes the
+    # result — so a read serving a stale version produces a patch computed
+    # against superseded text whose every built-in check still passes, and the
+    # intervening edit disappears with the call reporting success. The returned
+    # chars_before/after/delta cannot catch it either: they are measured from
+    # the same stale read, so they agree with each other.
+    #
+    # Chained on purpose. Each iteration's old_str is the PREVIOUS iteration's
+    # new_str, so a stale read cannot quietly match — it raises PatchNoMatch and
+    # names the backend. Looped because a propagation race that loses only
+    # sometimes is still a broken contract, and one round would usually win it.
+    store.update_summary(
+        "Consistency probe, revision r0, long enough to clear the shrink guard.",
+        category="config", project="ryw", tier="personal", key="probe", create_key=True,
+    )
+    for n in range(8):
+        store.patch_summary(old_str=f"revision r{n},", new_str=f"revision r{n + 1},",
+                            category="config", project="ryw", key="probe")
+        doc, meta, _ = store.get_summary("ryw", "config", key="probe")
+        assert f"revision r{n + 1}," in doc, (
+            f"read-after-write violated on round {n}: the slot came back as {doc!r}, "
+            f"without the revision just written"
+        )
+    assert "revision r8," in store.get_summary("ryw", "config", key="probe")[0]
+    print("  8 chained patches, each read back immediately, no stale version served.")
 
     print("\nContract satisfied.")

@@ -18,6 +18,17 @@ more would have failed at the port instead of at review.
 A RECORD is a plain dict: {"id", "document", "metadata"} and optionally
 "embedding". Drivers return the same shape, plus "distance" from similar().
 
+fetch_slot() TAKES BOTH AN ID AND THE COMPONENTS, which looks redundant and is
+not. The store owns id construction, so the id is what identifies the record;
+but a backend whose id lookup runs through an asynchronously maintained index
+cannot read its own writes through it, and a summary read that returns the
+previous version is not a stale cache — patch_summary computes its match, its
+archive copy and its patch counter from that read, so every refusal passes and
+the result is a self-consistent success that silently drops the intervening
+edit. Handing over the components as well lets such a backend address the item
+by its natural key instead and read it strongly consistently. A backend already
+addressed by id ignores them.
+
 DRIVERS OWN EMBEDDING. put() embeds any record that arrives without a vector,
 and similar() embeds the query text. This keeps two things working that a
 vector-only interface would have broken: Chroma's local-fallback path, where the
@@ -57,12 +68,15 @@ def chroma_where(
 
 class StorageDriver(Protocol):
     """
-    Seven methods. Anything a backend must provide, and nothing a backend should
+    Eight methods. Anything a backend must provide, and nothing a backend should
     decide — no id construction, no archive policy, no key gating.
     """
 
     def put(self, records: list[dict]) -> None: ...
     def fetch(self, ids: list[str], *, with_embeddings: bool = False) -> list[dict]: ...
+    def fetch_slot(self, record_id: str, *, project: Optional[str], category: str,
+                   key: Optional[str],
+                   with_embeddings: bool = False) -> Optional[dict]: ...
     def scan(self, filt: dict, *, with_documents: bool = True,
              with_embeddings: bool = False) -> list[dict]: ...
     def count(self, filt: Optional[dict] = None) -> int: ...
@@ -116,6 +130,17 @@ class ChromaDriver:
         include = ["documents", "metadatas"] + (["embeddings"] if with_embeddings else [])
         got = self.collection.get(ids=ids, include=include)
         return self._records(got, with_embeddings)
+
+    def fetch_slot(self, record_id: str, *, project: Optional[str], category: str,
+                   key: Optional[str],
+                   with_embeddings: bool = False) -> Optional[dict]:
+        """
+        Plain id lookup. A Chroma get() by id reads the collection itself rather
+        than a secondary index, so it already returns the latest write and the
+        natural-key components are unused here.
+        """
+        found = self.fetch([record_id], with_embeddings=with_embeddings)
+        return found[0] if found else None
 
     def scan(self, filt: dict, *, with_documents: bool = True,
              with_embeddings: bool = False) -> list[dict]:
