@@ -11,7 +11,7 @@
 # after a partial failure repairs rather than duplicates or errors out.
 #
 # What gets created, in your account:
-#   - Secret   context-mcp/credentials    (one JSON blob: Voyage + Chroma + token)
+#   - Secret   context-mcp/credentials    (one JSON blob: Voyage, plus the map's keys)
 #   - IAM role context-mcp-lambda-role    (Lambda execution, logs, read that secret)
 #   - Lambda   context-mcp                (python3.13, arm64, 512MB, SnapStart)
 #   - Alias    live                       (what clients point at)
@@ -48,8 +48,9 @@
 #
 # NOTE: the map's own app client is NOT provisioned by this script, and the
 # three variables it reads — MAP_CLIENT_ID, MAP_CLIENT_SECRET,
-# MAP_COGNITO_DOMAIN — are set out of band on the function. Everything else
-# here is reproducible from this file; that part is not, yet.
+# MAP_COGNITO_DOMAIN — are added to the secret out of band. The secret step below
+# therefore merges into an existing secret rather than replacing it. Everything
+# else here is reproducible from this file; that part is not, yet.
 #
 # There is deliberately no shared password anywhere in this deployment. A
 # static token cannot expire, cannot be revoked per device, and caps the
@@ -88,10 +89,11 @@ TIMEOUT_S=30
 HANDLER="mcp_server.server.handler"
 SECRET_NAME="context-mcp/credentials"
 LAMBDA_ROLE="context-mcp-lambda-role"
-# The DynamoDB store. Selected at runtime by the DYNAMODB_TABLE environment
-# variable — unset it and the Lambda falls back to Chroma, which is how a
-# rollback works without a code change. The table itself is created by
-# scripts/migrate_to_dynamodb.py, which owns the index and vector-index shape.
+# The DynamoDB store, named to the function by the DYNAMODB_TABLE environment
+# variable. It is required: Chroma was retired as a rollback path on 2026-08-18,
+# so an unset table fails at startup rather than falling back. The table itself
+# is created by scripts/migrate_to_dynamodb.py, which owns the index and
+# vector-index shape.
 DDB_TABLE="${DDB_TABLE:-context-mcp-store}"
 DEPLOY_ROLE="context-mcp-deploy-role"
 GITHUB_REPO="Anyth3nG/claude-context-mcp"
@@ -164,10 +166,10 @@ COGNITO_DOMAIN="context-mcp-${ACCOUNT_ID}"
 [ -f "$REPO_ROOT/.env" ] || { echo ".env not found at $REPO_ROOT/.env"; exit 1; }
 set -a; . "$REPO_ROOT/.env"; set +a
 
-for v in VOYAGE_API_KEY CHROMA_TENANT CHROMA_DATABASE CHROMA_API_KEY COGNITO_USER_EMAIL; do
+for v in VOYAGE_API_KEY COGNITO_USER_EMAIL; do
   [ -n "${!v:-}" ] || { echo "Missing $v in .env"; exit 1; }
 done
-info "voyage + chroma credentials present"
+info "voyage credentials present"
 info "cognito login identity: $COGNITO_USER_EMAIL"
 
 # No AUTH_TOKEN is generated any more. The endpoint is protected by Cognito
@@ -179,29 +181,42 @@ info "cognito login identity: $COGNITO_USER_EMAIL"
 say "Secret: $SECRET_NAME"
 # Built with python3 rather than string interpolation so any character in a
 # key (quotes, backslashes) is escaped correctly instead of producing invalid
-# JSON that only fails at runtime.
-SECRET_JSON="$(VOYAGE_API_KEY="$VOYAGE_API_KEY" CHROMA_TENANT="$CHROMA_TENANT" \
-  CHROMA_DATABASE="$CHROMA_DATABASE" CHROMA_API_KEY="$CHROMA_API_KEY" \
-  python3 -c '
-import json, os
-print(json.dumps({k: os.environ[k] for k in
-  ("VOYAGE_API_KEY","CHROMA_TENANT","CHROMA_DATABASE","CHROMA_API_KEY")}))')"
-
+# JSON that only fails at runtime. Values travel through the environment, never
+# argv, so they do not show up in a process listing while python runs.
+#
+# This script owns VOYAGE_API_KEY and nothing else in the secret. An existing
+# secret is MERGED into, not replaced: put-secret-value swaps the whole JSON
+# blob, and the MAP_* keys added out of band (see NOTE above) would otherwise be
+# wiped by any re-run.
 if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
-  info "already exists — updating its value to match .env"
+  CURRENT_SECRET="$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" \
+    --query SecretString --output text)"
+  SECRET_JSON="$(CURRENT_SECRET="$CURRENT_SECRET" VOYAGE_API_KEY="$VOYAGE_API_KEY" python3 -c '
+import json, os
+merged = json.loads(os.environ["CURRENT_SECRET"])
+merged["VOYAGE_API_KEY"] = os.environ["VOYAGE_API_KEY"]
+print(json.dumps(merged))')"
+  unset CURRENT_SECRET
+  KEY_NAMES="$(SECRET_JSON="$SECRET_JSON" python3 -c '
+import json, os
+print(", ".join(sorted(json.loads(os.environ["SECRET_JSON"]))))')"
+  info "already exists — updating VOYAGE_API_KEY from .env, keeping every other key"
   if [ "$APPLY" = 1 ]; then
     aws secretsmanager put-secret-value --secret-id "$SECRET_NAME" \
       --secret-string "$SECRET_JSON" --no-cli-pager >/dev/null
   else
-    info "[dry-run] would put-secret-value (4 keys, values not shown)"
+    info "[dry-run] would put-secret-value with keys: $KEY_NAMES (values not shown)"
   fi
 else
+  SECRET_JSON="$(VOYAGE_API_KEY="$VOYAGE_API_KEY" python3 -c '
+import json, os
+print(json.dumps({"VOYAGE_API_KEY": os.environ["VOYAGE_API_KEY"]}))')"
   if [ "$APPLY" = 1 ]; then
     aws secretsmanager create-secret --name "$SECRET_NAME" \
-      --description "context-mcp: Voyage + Chroma Cloud credentials" \
+      --description "context-mcp: Voyage API key and map login credentials" \
       --secret-string "$SECRET_JSON" --no-cli-pager >/dev/null
   else
-    info "[dry-run] would create-secret with 4 keys (values not shown)"
+    info "[dry-run] would create-secret with key: VOYAGE_API_KEY (values not shown)"
   fi
 fi
 SECRET_ARN="arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:${SECRET_NAME}"
