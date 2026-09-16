@@ -30,7 +30,7 @@ Omit `project` to see everything, which is the normal way to get oriented at the
 
 `categories` is the one list of categories shared by every project — the built-ins plus any created since — whatever `project` or `detail` you pass. Check it before filing something under a category you have not seen used.
 
-`chars` is the size of the stored summary, so you can tell what a get_context would actually cost before paying it. `updated` is the last write to that category — useful for spotting context that has gone stale. `history_chunks` counts accumulated point-in-time entries, which are reachable through search_context rather than get_context.
+`chars` is the size of the stored summary, so you can tell what a get_context would actually cost before paying it. `updated` is the last write to that category — useful for spotting context that has gone stale. `history_chunks` counts everything the store remembers that is no longer current — entries appended to history and archived versions of slots — and `history` splits the two. Reach it through get_history for a known key, or search_context.
 
 An empty result means the store holds nothing yet, not that a lookup failed."""
 

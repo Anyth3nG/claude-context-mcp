@@ -87,7 +87,7 @@ PATCH — pass `old_str` and `new_str`. Changes one passage and leaves everythin
 
 WHOLESALE — pass `content` and omit `old_str`. Replaces the slot entirely, or creates it if it does not exist yet. `content` must be the COMPLETE new state, not a fragment — whatever was stored is replaced, so sending only the changed part destroys the rest. A replacement under half the stored length is refused unless you pass `allow_shrink=true`, opening a NEW key in a category that already has slots needs `create_key=true`, and writing to a category that does not exist yet needs `create_category=true`.
 
-Use add_update INSTEAD for point-in-time facts that should accumulate — a decision made, an event, something discovered. Those belong in history, not in a slot that gets overwritten. This is the single most common way a slot bloats: a summary that narrates WHEN things changed is carrying history in the wrong place, and unlike history it is never cleaned up.
+Use add_update INSTEAD for history — something that happened, a measurement, finished work whose slot is gone. That belongs in history, not in a slot that gets overwritten. This is the single most common way a slot bloats: a summary that narrates WHEN things changed is carrying history in the wrong place, and unlike history it is never cleaned up.
 
 KEEP A SLOT UNDER 1000 CHARACTERS. That is not style — search_context clips every result at exactly 1000, so the remainder of a longer slot is invisible to anyone who does not already know its address. Length should follow the job: a reminder is 300-500, a decision worth defending later around 800, a design analysis someone will act from up to 1500. A write over the clip comes back with `oversized` saying how much is hidden.
 

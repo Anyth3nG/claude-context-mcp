@@ -106,6 +106,18 @@ body.reading .nav{background:var(--void-2);border-top:1px solid var(--haze)}
 .hist summary:focus-visible{outline:2px solid var(--patina);outline-offset:2px}
 .hist summary .caret{display:inline-block;width:11px;color:var(--patina)}
 .hist[open] summary .caret{transform:rotate(90deg)}
+/* A key's group inside the History section: one line to open, its rows beneath. */
+.hgroup{margin:6px 0 0 8px;border-left:1px solid var(--haze);padding-left:8px}
+.hgroup summary{list-style:none;cursor:pointer;padding:6px 2px;font-size:11.5px;
+  color:var(--dim);display:flex;gap:10px;align-items:baseline}
+.hgroup summary::-webkit-details-marker{display:none}
+.hgroup summary:hover{color:var(--star)}
+.hgroup summary b{font-family:var(--mono);font-weight:700;color:#9fb2cd}
+.hgroup[open] summary b{color:var(--star)}
+.hgroup summary .caret{display:inline-block;width:11px;color:var(--patina)}
+.hgroup[open] summary .caret{transform:rotate(90deg)}
+.hkind{font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--patina)}
+.hcount{font-size:10.5px;font-variant-numeric:tabular-nums;margin-left:auto}
 .hrow{display:grid;grid-template-columns:78px 1fr auto;gap:12px;align-items:baseline;
   width:100%;background:none;border:0;border-bottom:1px solid var(--haze);
   padding:9px 2px;cursor:pointer;text-align:left;font-family:var(--mono);color:var(--dim)}
@@ -174,7 +186,7 @@ body.reading .nav{background:var(--void-2);border-top:1px solid var(--haze)}
   </div>
 </header>
 
-<div class="hint" id="hint">← → travel · drag to pan · scroll to zoom · click a category to name its slots · faint motes are history</div>
+<div class="hint" id="hint">← → travel · drag to pan · scroll to zoom · click a category to name its slots · history lives in the catalogue</div>
 
 <nav class="nav">
   <button class="arrow" id="prev" aria-label="Previous project">&#8592;</button>
@@ -486,7 +498,7 @@ function openCat(p){
     (p.archived?`<span><b>${p.archived}</b> archived</span>`:"");
   const g=$("#groups"); g.innerHTML="";
   const byCat = {};
-  (p.history||[]).forEach(h => { (byCat[h.cat] ||= []).push(h); });
+  (p.history||[]).forEach(g => { (byCat[g.cat] ||= []).push(g); });
   // Union, so a category that exists only as history still gets a home.
   const cats = [...new Set([...p.slots.map(s=>s.cat), ...Object.keys(byCat)])];
   cats.forEach(cat=>{
@@ -506,18 +518,40 @@ function openCat(p){
       cards.appendChild(b);
     });
     sec.append(h,cards);
-    const hist = (byCat[cat]||[]).slice().sort((a,b)=>b.at.localeCompare(a.at));
-    if(hist.length){
+    /* One History section per category, grouped by the key each entry belongs
+       to: archived versions and appended entries side by side, because they are
+       one tier. A slot archived outright shows up here as its own group — before
+       2026-09-16 it was a count and nothing else. Entries with no key sit last,
+       under Unsorted, until someone files them. */
+    const groups = byCat[cat]||[];
+    if(groups.length){
+      const nv=groups.reduce((a,g)=>a+g.versions.length,0);
+      const na=groups.reduce((a,g)=>a+g.appended.length,0);
       const det=el("details","hist"), sum=el("summary");
-      sum.innerHTML=`<span class="caret">&#9656;</span>${hist.length} point-in-time `+
-        `note${hist.length>1?"s":""} — newest first`;
+      sum.innerHTML=`<span class="caret">&#9656;</span>History — `+
+        `${nv} archived version${nv===1?"":"s"}, ${na} appended, `+
+        `${groups.length} key${groups.length===1?"":"s"}`;
       det.appendChild(sum);
-      hist.forEach(h=>{
-        const row=el("button","hrow");
-        row.append(el("span","hdate",h.at), el("span","hexc",h.text),
-                   el("span","hchars",nf(h.chars)+" ch"));
-        row.onclick=()=>readChunk(h,p);
-        det.appendChild(row);
+      const KIND={live:"live slot", archived:"archived slot", appended:"key only", unsorted:"no key"};
+      groups.forEach(g=>{
+        const gd=el("details","hgroup"), gs=el("summary");
+        const counts=[g.versions.length?`${g.versions.length} version${g.versions.length>1?"s":""}`:"",
+                      g.appended.length?`${g.appended.length} appended`:""].filter(Boolean).join(" · ");
+        gs.innerHTML=`<span class="caret">&#9656;</span><b>${g.key||"Unsorted"}</b>`+
+          `<span class="hkind">${KIND[g.kind]}</span><span class="hcount">${counts}</span>`;
+        gd.appendChild(gs);
+        const items=[...g.versions.map(v=>({...v,what:"version"})),
+                     ...g.appended.map(a=>({...a,what:"appended"}))]
+          .sort((a,b)=>b.at.localeCompare(a.at));
+        items.forEach(h=>{
+          const row=el("button","hrow");
+          row.append(el("span","hdate",h.at.slice(0,10)),
+                     el("span","hexc",(h.what==="version"?"⟲ ":"")+h.text),
+                     el("span","hchars",nf(h.chars)+" ch"));
+          row.onclick=()=>h.what==="version"?readVersion(h,g,p):readChunk(h,g,p);
+          gd.appendChild(row);
+        });
+        det.appendChild(gd);
       });
       sec.appendChild(det);
     }
@@ -551,7 +585,7 @@ function showCard(n){
   if(isProj){
     const cats=[...new Set(p.slots.map(s=>s.cat))];
     c.appendChild(el("p","cm",
-      `${p.slots.length} slots · ${nf(p.chars)} characters · ${(p.history||[]).length} history`
+      `${p.slots.length} slots · ${nf(p.chars)} characters · ${p.chunks} history`
       + (p.archived?` · ${p.archived} archived`:"") + (p.tier!=="general"?` · ${p.tier}`:"")));
     c.appendChild(el("p","cd","No stored summary — a project is its slots. Listed by category:"));
     const list=el("div","cl");
@@ -573,7 +607,8 @@ function showCard(n){
     c.appendChild(go);
   } else {
     const inCat=p.slots.filter(s=>s.cat===n.cat);
-    const hist=(p.history||[]).filter(h=>h.cat===n.cat).length;
+    const hist=(p.history||[]).filter(g=>g.cat===n.cat)
+      .reduce((a,g)=>a+g.versions.length+g.appended.length,0);
     c.appendChild(el("p","cm",
       `${inCat.length} slots · ${nf(inCat.reduce((a,s)=>a+s.chars,0))} characters`
       + (hist?` · ${hist} history`:"")));
@@ -606,14 +641,27 @@ function read(s,p){
   $("#drawer").classList.add("on"); $("#drawer").setAttribute("aria-hidden","false");
   $("#scrim").classList.add("on"); x.focus();
 }
-function readChunk(h,p){
+function readChunk(h,g,p){
   const d=$("#dpad"); d.innerHTML="";
   const x=el("button","dclose","Close"); x.onclick=shut; d.appendChild(x);
-  d.appendChild(el("p","dcat",p.name+" / "+h.cat+" / history"));
-  d.appendChild(el("h3","dkey","Point-in-time note"));
+  d.appendChild(el("p","dcat",p.name+" / "+g.cat+" / "+(g.key||"unsorted")+" / history"));
+  d.appendChild(el("h3","dkey","Appended entry"));
   d.appendChild(el("p","dmeta",
-    `${nf(h.chars)} characters · recorded ${h.at} · append-only, never revised`));
+    `${nf(h.chars)} characters · recorded ${h.at} · append-only, never revised`
+    + (g.key?"":" · no key — not yet sorted")));
   d.appendChild(el("p","dtext",h.text));
+  $("#drawer").classList.add("on"); $("#drawer").setAttribute("aria-hidden","false");
+  $("#scrim").classList.add("on"); x.focus();
+}
+function readVersion(v,g,p){
+  const d=$("#dpad"); d.innerHTML="";
+  const x=el("button","dclose","Close"); x.onclick=shut; d.appendChild(x);
+  d.appendChild(el("p","dcat",p.name+" / "+g.cat+" / "+g.key+" / history"));
+  d.appendChild(el("h3","dkey","Archived version"));
+  d.appendChild(el("p","dmeta",`${nf(v.chars)} characters · stopped being current ${v.at}`
+    + (g.kind==="archived"?" · slot archived":"")));
+  if(v.why) d.appendChild(el("div","ver-w",v.why));
+  d.appendChild(el("p","dtext",v.text));
   $("#drawer").classList.add("on"); $("#drawer").setAttribute("aria-hidden","false");
   $("#scrim").classList.add("on"); x.focus();
 }

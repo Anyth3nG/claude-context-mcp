@@ -24,6 +24,7 @@ import json
 import json as _json
 
 from shared.store import (
+    APPENDED_SOURCE,
     BUILTIN_CATEGORIES,
     INDEX_EXCLUDED_SOURCES,
     MAX_CATEGORY_CHARS,
@@ -308,27 +309,26 @@ def run(make_store) -> None:
     print(f"\npatch-test: index {map_chars} chars vs get_brief {brief_chars} chars")
     assert map_chars < brief_chars
 
-    print("\n=== index(): superseded archives are excluded, live chunks counted ===")
-    live_general = store.count(project="general", type="chunk",
-                               exclude_sources=(SUPERSEDED_SOURCE,))
-    assert idx["projects"]["general"]["history_chunks"] == live_general
+    print("\n=== index(): history is ONE tier — appended and archived counted together ===")
+    general_history = store.count(project="general", type="chunk",
+                                  exclude_sources=(RETIRED_SOURCE,))
+    assert idx["projects"]["general"]["history_chunks"] == general_history
     # patch-test accumulated superseded copies during the patch tests above;
-    # none of them may show up as history.
+    # they are history and must be counted, and named as what they are.
     archived = store.records(project="patch-test", source=SUPERSEDED_SOURCE)
     assert len(archived) >= 2, "expected archives from the patch tests"
-    assert idx["projects"]["patch-test"]["history_chunks"] == 0, "archives leaked into the index"
-    print(f"OK, {len(archived)} archived copies present and none counted as history.")
+    hist = idx["projects"]["patch-test"]["history"]
+    assert hist["archived_versions"] == len(archived), "archived versions missing from the index"
+    assert idx["projects"]["patch-test"]["history_chunks"] == hist["appended"] + hist["archived_versions"]
+    print(f"OK, {len(archived)} archived copies counted as history, split out as archived_versions.")
 
-    # Search visibility and index arithmetic are deliberately DIFFERENT sets.
-    # Superseded copies became ordinary search results on 2026-08-16, but the
-    # index still leaves them out of history_chunks because it reports them
-    # separately as prior_versions — counting both would double-count.
-    assert SUPERSEDED_SOURCE in INDEX_EXCLUDED_SOURCES
-    assert SUPERSEDED_SOURCE not in SEARCH_HIDDEN_SOURCES
+    # Only material the store has been told is WRONG stays out — of search and
+    # of the count alike. The two exclusions were different sets until
+    # 2026-09-16; making history one tier made them the same.
+    assert INDEX_EXCLUDED_SOURCES == SEARCH_HIDDEN_SOURCES == (RETIRED_SOURCE,)
     visible = store.search("alpha beta gamma", project="patch-test", top_k=10)["ids"][0]
-    assert any(a["id"] in visible for a in archived), \
-        "the same copies the index excludes must still be searchable"
-    print("  and the same copies ARE searchable — the two exclusions are separate on purpose.")
+    assert any(a["id"] in visible for a in archived), "archived copies must be searchable"
+    print("  and the same copies ARE searchable.")
 
     print("\n=== index(project=...) scopes, and an unknown project is empty not an error ===")
     scoped = store.index(project="patch-test")
@@ -580,7 +580,7 @@ def run(make_store) -> None:
         reason="SnapStart means a cold start does NOT pick up a rotated secret.",
         superseded_by="config/rotation",
     )
-    assert res["retired"] and res["previous_source"] == "live"
+    assert res["retired"] and res["previous_source"] == APPENDED_SOURCE
     assert wrong not in _visible(), "retired chunk must drop out of default search"
     assert other in _visible(), "retiring one chunk must not affect its neighbours"
     print("  hidden from search, neighbour untouched.")
@@ -767,6 +767,26 @@ def run(make_store) -> None:
                                tier="personal", key="probe", allow_shrink=True)
     assert res["oversized"] is None, "condensing below the clip must clear the signal"
     print(f"  reported crossing, staying over, and clearing, against a {MAX_DOC_CHARS}-char clip.")
+
+    print("\n=== History is one tier: appended entries carry their own source ===")
+    res = store.save_chunks(["Alarm fired twice overnight."], category="config",
+                            project="histtest", tier="personal", key="alerting")
+    assert res["source"] == APPENDED_SOURCE, "add_update's writes are history, labelled as such"
+    # The old default is corrected, not stored: a chunk is never "live".
+    old = store.save(document="Written by an older caller.", category="config", type="chunk",
+                     project="histtest", tier="personal", source="live")
+    assert old["source"] == APPENDED_SOURCE
+    store.update_summary("Alarm at 5 per 300s.", category="config", project="histtest",
+                         tier="personal", key="alerting")
+    store.update_summary("Alarm at 8 per 300s.", category="config", project="histtest",
+                         tier="personal", key="alerting")
+    h = store.slot_history("histtest", "config", key="alerting")
+    assert h["version_count"] == 1 and h["appended_count"] == 1, h
+    assert h["appended"][0]["content"] == "Alarm fired twice overnight."
+    hist = store.index(project="histtest")["projects"]["histtest"]
+    assert hist["history"] == {"appended": 2, "archived_versions": 1}, hist["history"]
+    assert hist["history_chunks"] == 3
+    print("  appended, coerced from 'live', listed under its key by slot_history, counted once.")
 
     # Last on purpose: every category this section creates widens the list that
     # typo correction matches against, and earlier sections assume the built-ins.

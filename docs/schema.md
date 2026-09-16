@@ -19,7 +19,7 @@ proved against), enforced by `shared/conformance.py` running against both. How t
 | `tier` | string | Yes if `project` set | `"client"` or `"personal"`. Signals how much retrieval depth/effort is warranted. Omitted for general entries — `ContextStore.save()` strips it if `project` isn't set, even if a caller passes one. |
 | `category` | string | Yes | What kind of thing this is. See categories below. Applies to every entry, project or not. |
 | `type` | string | Yes | `"summary"` (living, distilled doc for a project+category) or `"chunk"` (raw conversation fragment, fallback layer). |
-| `source` | string | Yes | `"backfill"` or `"live"` — where this entry came from. Useful for debugging and for knowing what's safe to bulk-regenerate. |
+| `source` | string | Yes | What the entry is. `"live"` — a summary, the only current tier. `"appended"` — a chunk written to history through `add_update` (stored as `"live"` until 2026-09-16, when `scripts/relabel_appended.py` moved them). `"superseded"` — an archived version of a slot. `"retired"` — a chunk marked wrong. Older backfilled chunks may carry `"backfill"`. |
 | `timestamp` | ISO 8601 string | Yes | When this was written (not necessarily when the underlying conversation happened — track both if they diverge). |
 | `chat_title` | string | No | Original conversation title, if this came from a claude.ai export. Helps trace an entry back to its source chat. |
 | `category_corrected_from` | string | No | Present only if the `category` passed in was a typo that got auto-corrected (see Category enforcement below). Holds the original, uncorrected value. |
@@ -275,10 +275,14 @@ migration; an entry silently filed under the wrong one cannot be found to move.
 
 ### Two tiers, not three: summaries are current, everything else is history
 
-A `summary` is the live tier — the only thing that answers "what is true now".
-Everything else is one uniform history tier: chunks appended through
-`add_update`, and ex-summaries archived from a slot, are the same kind of thing
-and rank together in search.
+A `summary` is the live tier — the only thing that answers "what is true now",
+and the only record whose `source` is `"live"`. Everything else is one uniform
+history tier: chunks appended through `add_update` (`source: "appended"`), and
+ex-summaries archived from a slot (`source: "superseded"`), are the same kind
+of thing and rank together in search. Both are addressed by the key they belong
+to, so `get_history(project, category, key)` returns the slot's version chain
+and the entries appended under that key together; the map groups them the same
+way. Appended entries with no key are history nobody has sorted yet.
 
 That was three tiers until 2026-08-16, with `source: "superseded"` hidden from
 search behind an `include_superseded` flag. Hiding it was wrong on its own terms:
@@ -300,11 +304,12 @@ reachable with `include_retired=True` for auditing. `superseded_from` survives a
 provenance — it says which slot a copy came from, it just no longer gates
 visibility.
 
-One deliberate asymmetry: `index()` still excludes superseded copies from its
-`history_chunks` count (`INDEX_EXCLUDED_SOURCES`). Search visibility and map
-arithmetic are different questions — the index reports archived material
-separately as `prior_versions` and `archived_slots`, so counting it as history
-too would double-count it and make every edited slot look like growth.
+`index()` counts the same way since 2026-09-16: `history_chunks` is every chunk
+that is not retired, and `history` beside it says how many were appended and
+how many are archived versions (`INDEX_EXCLUDED_SOURCES` equals
+`SEARCH_HIDDEN_SOURCES`). Archived versions used to be left out of the count to
+avoid double-counting against `prior_versions`; the result was a total that
+under-reported the store by about a third, which was the worse error.
 
 ## The tool surface: seven
 

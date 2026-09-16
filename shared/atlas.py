@@ -15,14 +15,19 @@ What this deliberately does NOT do is as load-bearing as what it does:
     relationship that did not exist, and deriving links by name-matching
     produced one out of a sentence saying two projects should NOT be
     conflated. Similarity is never an edge.
-  - Superseded and retired chunks are dropped. They belong to the slot that
-    replaced them, not to the history band.
+  - Retired chunks are dropped: the store has been told they are wrong.
+    Everything else that is not current — appended entries and archived
+    versions alike — is ONE history, grouped under the key it belongs to.
+    Until 2026-09-16 archived versions were left out of the history band and
+    slots archived outright appeared nowhere but a count.
   - Nothing invents a project overview. A project is its slots.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from shared.store import APPENDED_SOURCE, SUPERSEDED_SOURCE
 
 # The page template, with a __DATA__ placeholder where the payload goes. It is a
 # file rather than a string literal so the served route and the offline
@@ -59,41 +64,80 @@ def build_atlas_data(store) -> dict:
     """
     idx = store.index()["projects"]
 
-    # The live history: point-in-time facts that no summary represents. They
-    # carry a project and a category, which is enough to place them.
-    history: dict[str, list] = {}
-    for record in store.records(type="chunk", source="live"):
-        # superseded and retired stay out; they belong to a slot
-        doc = record.get("document") or ""
-        history.setdefault(record.get("project") or "general", []).append({
-            "id": record["id"], "cat": record.get("category") or "note", "text": doc,
-            "at": (record.get("timestamp") or "")[:10], "chars": len(doc),
+    # Every history record, read in two scans and grouped by the key it belongs
+    # to. Two scans rather than one slot_history call per key: the atlas wants
+    # every key at once, and per-key queries are what once pushed /map past the
+    # Lambda timeout.
+    groups: dict[tuple, dict] = {}
+
+    def group(project: str, cat: str, key):
+        return groups.setdefault((project, cat, key), {
+            "cat": cat, "key": key, "versions": [], "appended": [], "_events": {},
         })
-    for v in history.values():
-        v.sort(key=lambda c: (c["cat"], c["at"]))
+
+    for r in store.records(type="chunk", source=APPENDED_SOURCE):
+        doc = r.get("document") or ""
+        g = group(r.get("project") or "general", r.get("category") or "note", r.get("key") or None)
+        g["appended"].append({"id": r["id"], "at": (r.get("timestamp") or "")[:10],
+                              "chars": len(doc), "text": doc})
+    for r in store.records(source=SUPERSEDED_SOURCE):
+        g = group(r.get("project") or "general", r.get("category") or "note", r.get("key") or None)
+        # One archival event may be several pieces (see _split_for_archive);
+        # they share a superseded_at stamp and stitch back into one version.
+        g["_events"].setdefault(r.get("superseded_at") or "", []).append(r)
+
+    for g in groups.values():
+        for stamp, pieces in g["_events"].items():
+            pieces.sort(key=lambda r: r.get("split_index") or 0)
+            text = "\n\n".join(r.get("document") or "" for r in pieces)
+            g["versions"].append({"at": stamp[:16].replace("T", " "), "chars": len(text),
+                                  "text": text, "why": pieces[0].get("archived_reason")})
+        del g["_events"]
+        g["versions"].sort(key=lambda v: v["at"], reverse=True)
+        g["appended"].sort(key=lambda a: a["at"], reverse=True)
+        g["last"] = max([v["at"][:10] for v in g["versions"]] +
+                        [a["at"] for a in g["appended"]] + [""])
 
     projects = []
     for name, meta in idx.items():
         entries = store.get_brief(name if name != "general" else None)
+        live_keys = {(e["category"], e["key"]) for e in entries}
         slots = []
         for e in entries:
             label = e["category"] + (f"/{e['key']}" if e["key"] else "")
-            prior = meta["summaries"].get(label, {}).get("prior_versions", 0)
-            versions = []
-            if prior:
-                h = store.slot_history(name if name != "general" else None, e["category"], e["key"])
-                versions = [{"at": (v["superseded_at"] or "")[:16].replace("T", " "),
-                             "chars": v["chars"], "text": v["content"], "why": v["reason"]}
-                            for v in h["versions"]]
+            g = groups.get((name, e["category"], e["key"]))
+            versions = g["versions"] if g else []
             slots.append({"cat": e["category"], "key": e["key"], "label": label,
                           "chars": len(e["content"]), "text": e["content"],
                           "updated": (e["timestamp"] or "")[:10],
-                          "prior": prior, "versions": versions})
+                          "prior": len(versions), "versions": versions})
         slots.sort(key=lambda x: (x["cat"], x["key"] or ""))
+
+        history = []
+        for (proj, cat, key), g in groups.items():
+            if proj != name:
+                continue
+            # What the key IS today decides how its history reads: versions of
+            # a slot still live, the whole record of a slot that was archived,
+            # entries filed under a key that never had a slot, or entries with
+            # no key at all — the ones still waiting to be sorted.
+            kind = ("unsorted" if key is None else
+                    "live" if (cat, key) in live_keys else
+                    "archived" if g["versions"] else "appended")
+            history.append({**g, "kind": kind})
+        # Newest activity first within a kind; kinds in the order a reader
+        # wants them, current slots' pasts before orphans; unsorted last.
+        order = {"live": 0, "archived": 1, "appended": 2, "unsorted": 3}
+        history.sort(key=lambda g: g["last"], reverse=True)
+        history.sort(key=lambda g: (g["cat"], order[g["kind"]]))
+
+        # Counted from what the page lists, not from the index: a version
+        # archived in pieces is several records there and one version here.
         projects.append({"name": name, "tier": meta.get("tier", "general"), "slots": slots,
-                         "chars": meta["brief_chars"], "chunks": meta["history_chunks"],
+                         "chars": meta["brief_chars"],
+                         "chunks": sum(len(g["versions"]) + len(g["appended"]) for g in history),
                          "archived": meta.get("archived_slots", 0),
-                         "history": history.get(name, [])})
+                         "history": history})
     projects.sort(key=lambda p: -p["chars"])
 
     return {"projects": projects, "totals": {

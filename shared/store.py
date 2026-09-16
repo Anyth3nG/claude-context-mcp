@@ -108,6 +108,16 @@ def _search_visibility(document: str, previous_doc: Optional[str] = None) -> Opt
 # How close a typo must be to auto-correct (0-1, difflib ratio).
 CATEGORY_MATCH_CUTOFF = 0.75
 
+# The source every history chunk written through add_update carries. Until
+# 2026-09-16 those were stored as "live" — the same word a current summary
+# carries — so the only thing separating history from current state was the
+# record type. Now "live" means a summary and nothing else: every chunk is
+# history, and its source says which kind (appended here, superseded from a
+# slot, retired as wrong). scripts/relabel_appended.py moved the existing rows.
+APPENDED_SOURCE = "appended"
+# What a summary carries. Named so the two are never compared as bare strings.
+LIVE_SOURCE = "live"
+
 # Marks a summary that has been replaced. Archived copies keep the full text and,
 # since 2026-08-16, are VISIBLE in ordinary search alongside any other chunk —
 # they are history, and history is what the chunk tier is for. The provenance is
@@ -136,13 +146,14 @@ RETIRED_SOURCE = "retired"
 # contradiction risk being guarded against.
 SEARCH_HIDDEN_SOURCES = (RETIRED_SOURCE,)
 
-# What index() leaves out of its history_chunks count — deliberately NOT the same
-# set as SEARCH_HIDDEN_SOURCES, though the two were one constant until 2026-08-16.
-# Search visibility and map arithmetic are different questions: the index already
-# reports archived material separately as prior_versions and archived_slots, so
-# counting superseded copies here as well would double-count them and make every
-# edited slot look like the project had grown.
-INDEX_EXCLUDED_SOURCES = (SUPERSEDED_SOURCE, RETIRED_SOURCE)
+# What index() leaves out of its history count. Since 2026-09-16 this is the
+# same set as SEARCH_HIDDEN_SOURCES: history is ONE tier (decisions/live-slot-rule
+# in the store), so history_chunks counts everything the store remembers that is
+# not current — appended entries and archived versions alike — and the `history`
+# breakdown beside it says how much of each. Superseded copies used to be left
+# out to avoid double-counting against prior_versions; that made the total
+# under-report the store by a third, which was the worse error.
+INDEX_EXCLUDED_SOURCES = (RETIRED_SOURCE,)
 
 # A replacement shorter than this fraction of the current summary is refused.
 # Catches the characteristic failure of overwrite-in-place: a caller that read a
@@ -753,6 +764,11 @@ class ContextStore:
         )
         if type not in VALID_TYPES:
             raise ValueError(f"type must be one of {VALID_TYPES}, got '{type}'")
+        if type == "chunk" and source == LIVE_SOURCE:
+            # A chunk is history by definition; "live" names a summary. Older
+            # callers still pass the old default, so it is corrected rather
+            # than refused.
+            source = APPENDED_SOURCE
 
         project_key = project or "general"
         if not project:
@@ -895,7 +911,7 @@ class ContextStore:
         category: str,
         project: Optional[str] = None,
         tier: Optional[str] = None,
-        source: str = "live",
+        source: str = APPENDED_SOURCE,
         chat_title: Optional[str] = None,
         timestamp: Optional[str] = None,
         key: Optional[str] = None,
@@ -937,6 +953,8 @@ class ContextStore:
         category, corrected_from, created = self._resolve_category_for_write(
             category, create_category
         )
+        if source == LIVE_SOURCE:
+            source = APPENDED_SOURCE  # see save(): a chunk is never "live"
         project_key = project or "general"
         key = _normalize_key(key)
         if not project:
@@ -1142,6 +1160,21 @@ class ContextStore:
         # being asked for, and reverse-chronological reads as a changelog.
         versions.sort(key=lambda v: v["superseded_at"] or "", reverse=True)
 
+        # Entries written straight to history under this key. They are the
+        # other half of "what happened here": a version chain says how the
+        # slot's text changed, an appended entry records something that
+        # happened alongside it — a finished task, a measurement, an event.
+        # Same address, so they are answered by the same question.
+        appended = [
+            {"id": r["id"], "content": r["document"], "chars": len(r["document"]),
+             "written_at": r["metadata"].get("timestamp")}
+            for r in self.driver.scan({
+                "project": project or "general", "category": category,
+                "key": key, "type": "chunk", "source": APPENDED_SOURCE,
+            })
+        ]
+        appended.sort(key=lambda a: a["written_at"] or "", reverse=True)
+
         current = self.get_summary(project, category, key=key)
         return {
             "slot": category + (f"/{key}" if key else ""),
@@ -1155,6 +1188,8 @@ class ContextStore:
             "archived_slot": current is None and bool(versions),
             "versions": versions,
             "version_count": len(versions),
+            "appended": appended,
+            "appended_count": len(appended),
             "category_corrected_from": corrected_from,
         }
 
@@ -1561,7 +1596,8 @@ class ContextStore:
 
         def slot(name: str) -> dict:
             return projects.setdefault(
-                name, {"summaries": {}, "brief_chars": 0, "history_chunks": 0}
+                name, {"summaries": {}, "brief_chars": 0, "history_chunks": 0,
+                       "history": {"appended": 0, "archived_versions": 0}}
             )
 
         # Slots archived outright have no live summary to hang a version count
@@ -1609,6 +1645,10 @@ class ContextStore:
         for meta in (r["metadata"] for r in chunks):
             entry = slot(meta.get("project") or "general")
             entry["history_chunks"] += 1
+            # One total, two kinds: what was written straight to history, and
+            # what became history by being replaced. Same tier, different origin.
+            kind = "archived_versions" if meta.get("source") == SUPERSEDED_SOURCE else "appended"
+            entry["history"][kind] += 1
             if meta.get("tier"):
                 entry.setdefault("tier", meta["tier"])
 

@@ -30,13 +30,13 @@ This is the canonical cross-machine, cross-client store — NOT any local, singl
 
 SPLIT AS YOU WRITE. `content` accepts a LIST, and several focused entries cost the same as one long one — the whole list is embedded in a single call. Retrieval truncates long entries to ~1000 characters, so anything longer is only ever partly visible no matter how it's searched for. One self-contained fact per list item; never pad a short fact to fill one.
 
-Use add_update for point-in-time facts that ACCUMULATE: a decision made, an event, a discovery, something the user stated. Nothing is overwritten, so history builds up.
+add_update WRITES HISTORY. Everything it stores is filed as history (source=appended), never as current state: use it for what HAPPENED, not for what is TRUE — an event, a measurement, an observation that is not a revision of one statement, finished work whose slot no longer exists. Nothing is overwritten.
 
-Use patch_context INSTEAD when revising the CURRENT STATE of something that already has a value. Appending a corrected version here leaves the outdated one in place, and future sessions must then read both and guess which still holds.
+Use patch_context INSTEAD for anything that describes current state: a decision, a preference, a fact about the user, a task. Those live in a slot, where get_context finds them; appended here they are history from the moment they are written, invisible to get_context, and a future session reading the slot never learns they exist. Record a decision here only as the event — when and why — beside the slot that holds it.
 
 Pass `key` when the fact clearly belongs to one sub-topic — it files the entry alongside that slot's history instead of loose in the category. Unlike a summary key it is ungated: the key need not already have a summary, and coining a new one is fine. Omit it rather than guessing; a wrong key is worse than none.
 
-Save when: a real decision gets made, the user states a lasting preference or fact about themselves, or sets or updates a task.
+Save when: something happened that a future session would want to know happened — a deploy, an incident, a measurement, a step completed.
 
 Do NOT save: hypotheticals or options weighed but not chosen, restatements of something already in THIS store (check with search_context), transient debugging detail, or anything you're unsure is worth surfacing again. When in doubt, don't — a missed save is cheap to redo; a bad save pollutes retrieval permanently."""
 
@@ -101,7 +101,6 @@ def add_update(
             category=category,
             project=project,
             tier=tier,
-            source="live",
             key=key,
             create_category=create_category,
         )
