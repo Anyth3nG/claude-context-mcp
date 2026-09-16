@@ -82,8 +82,9 @@ Projection: ALL
 `search_context` hands back ids, and `archive(id)` and `record(id)` consume them.
 Those ids cannot be parsed back into an address: `summary-context-mcp-config-api-gateway`
 has hyphens in the project *and* the key, so recovering the parts requires
-scanning for a token that happens to be in `VALID_CATEGORIES`. That works today
-and would break the first time a project is named after a category.
+scanning for a token that happens to be a known category. That would break the
+first time a project is named after a category — and since categories can be
+created at runtime, there is no fixed list to scan against anyway.
 
 So ids stay opaque handles and get their own index. Keeping the existing id
 format also means every id already recorded in the store, in `docs/`, and in

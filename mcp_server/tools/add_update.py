@@ -19,7 +19,7 @@ from typing import Annotated, Optional, Union
 
 from pydantic import Field
 
-from shared.store import MAX_DOC_CHARS
+from shared.store import MAX_DOC_CHARS, UnknownCategory
 
 from mcp_server.context import get_store
 from mcp_server.review_log import log_write
@@ -54,8 +54,10 @@ def add_update(
     category: Annotated[
         str,
         Field(
-            description="tech_stack, architecture, config, or decisions for project-scoped entries; "
-            "preference, fact, tasks, or note for general ones. Close typos are auto-corrected."
+            description="What kind of entry this is. Built in: tech_stack, architecture, config, "
+            "decisions (usually project-scoped); preference, fact, tasks, note (usually general). "
+            "Categories created later are listed by get_index. Close typos are auto-corrected; "
+            "a new name needs create_category=true."
         ),
     ],
     project: Annotated[
@@ -80,18 +82,40 @@ def add_update(
             "clearly belong to one topic; a wrong key is worse than none."
         ),
     ] = None,
+    create_category: Annotated[
+        bool,
+        Field(
+            description="Set true ONLY to create a category that does not exist yet. It becomes "
+            "available to every project, and search can filter on it. Without it an unknown "
+            "category is refused and the existing ones come back. Most new topics are a key, not "
+            "a category — create one only for a new KIND of entry you would want to search by."
+        ),
+    ] = False,
 ) -> dict:
     store = get_store()
     documents = [content] if isinstance(content, str) else list(content)
 
-    result = store.save_chunks(
-        documents=documents,
-        category=category,
-        project=project,
-        tier=tier,
-        source="live",
-        key=key,
-    )
+    try:
+        result = store.save_chunks(
+            documents=documents,
+            category=category,
+            project=project,
+            tier=tier,
+            source="live",
+            key=key,
+            create_category=create_category,
+        )
+    except UnknownCategory as refusal:
+        # Returned, not raised, for the same reason as an unknown key: the caller
+        # can only pick an existing category if it can see the list.
+        return {
+            "added": False,
+            "refused": "unknown_category",
+            "reason": str(refusal),
+            "existing_categories": refusal.known,
+            "hint": "Reuse whichever of these fits, or resend with create_category=true "
+                    "if this really is a new kind of entry.",
+        }
 
     for chunk_id, document in zip(result["ids"], documents):
         log_write(
@@ -122,6 +146,8 @@ def add_update(
     }
     if result.get("key"):
         response["key"] = result["key"]
+    if result.get("category_created"):
+        response["category_created"] = result["category"]
     if result["duplicates_collapsed"]:
         response["duplicates_collapsed"] = result["duplicates_collapsed"]
         response["duplicate_note"] = (

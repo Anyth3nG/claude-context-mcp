@@ -52,9 +52,10 @@ def get_context(
     category: Annotated[
         Optional[str],
         Field(
-            description="Narrow to one category: tech_stack, architecture, config or decisions "
-            "for project-scoped entries; preference, fact, tasks or note for general ones. Omit "
-            "for the whole project. Close typos are auto-corrected."
+            description="Narrow to one category. Built in: tech_stack, architecture, config, "
+            "decisions (usually project-scoped); preference, fact, tasks, note (usually general); "
+            "get_index lists every category, including ones created later. Omit for the whole "
+            "project. Close typos are auto-corrected."
         ),
     ] = None,
     key: Annotated[

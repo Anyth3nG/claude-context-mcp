@@ -28,6 +28,8 @@ Use the default detail="slots" once you know which project you care about, or wh
 
 Omit `project` to see everything, which is the normal way to get oriented at the start of a session. Pass one to scope it.
 
+`categories` is the one list of categories shared by every project — the built-ins plus any created since — whatever `project` or `detail` you pass. Check it before filing something under a category you have not seen used.
+
 `chars` is the size of the stored summary, so you can tell what a get_context would actually cost before paying it. `updated` is the last write to that category — useful for spotting context that has gone stale. `history_chunks` counts accumulated point-in-time entries, which are reachable through search_context rather than get_context.
 
 An empty result means the store holds nothing yet, not that a lookup failed."""

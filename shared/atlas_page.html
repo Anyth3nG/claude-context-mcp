@@ -203,6 +203,9 @@ const el = (t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;
   if(x!==undefined)n.textContent=x;return n;};
 const nf = v => v.toLocaleString();
 const css = k => getComputedStyle(document.documentElement).getPropertyValue("--"+k).trim();
+// Categories can be created at runtime, so one with no palette entry of its own
+// falls back to the neutral colour rather than rendering with none.
+const catColor = k => css(k) || css("patina");
 const P = D.projects;
 const HINT = "← → travel · drag to pan · scroll to zoom · click a category to name its slots";
 
@@ -319,7 +322,7 @@ function frame(){
     ctx.lineWidth = (on ? 1.15 : .8) * Math.min(cam.k,1.5);
     c.lines.forEach(([a,b])=>{
       const g=ctx.createLinearGradient(sx(a),sy(a),sx(b),sy(b));
-      const col = b.cat ? css(b.cat) : css("patina");
+      const col = b.cat ? catColor(b.cat) : css("patina");
       const dimLine = on && focusCat && b.cat && b.cat!==focusCat;
       g.addColorStop(0,"rgba(120,140,175,"+(fade*(dimLine?.13:.34))+")");
       g.addColorStop(1,col+(on?(dimLine?"33":"88"):"22"));
@@ -328,7 +331,7 @@ function frame(){
     });
     c.stars.forEach(n=>{
       const x=sx(n), y=sy(n), r=radius(n)*(on?1:.72);
-      const col = n.kind==="anchor" ? css("patina") : css(n.cat);
+      const col = n.kind==="anchor" ? css("patina") : catColor(n.cat);
       const isCat = n.kind==="cat" || n.kind==="catmain";
       if(on){ const gl=ctx.createRadialGradient(x,y,0,x,y,r*4.4);
         gl.addColorStop(0,col+"55"); gl.addColorStop(1,col+"00");
@@ -488,7 +491,7 @@ function openCat(p){
   const cats = [...new Set([...p.slots.map(s=>s.cat), ...Object.keys(byCat)])];
   cats.forEach(cat=>{
     const sec=el("section","group"), h=el("div","group-hd");
-    const sw=el("span","sw"); sw.style.background=css(cat);
+    const sw=el("span","sw"); sw.style.background=catColor(cat);
     h.append(sw, el("span",null,cat), el("span","ln"));
     const cards=el("div","cards");
     p.slots.filter(s=>s.cat===cat).forEach(s=>{
@@ -540,7 +543,7 @@ $("#backbtn").onclick=closeCat;
 function showCard(n){
   const c=$("#card"); c.innerHTML="";
   const p=n.proj, isProj = n.kind==="anchor";
-  c.style.borderTopColor = isProj ? css("patina") : css(n.cat);
+  c.style.borderTopColor = isProj ? css("patina") : catColor(n.cat);
 
   c.appendChild(el("p","ck", isProj ? "project" : p.name + " / category"));
   c.appendChild(el("h4","cn", isProj ? p.name : n.cat));

@@ -31,6 +31,7 @@ from shared.store import (
     PatchNoOp,
     PatchSlotMissing,
     SummaryShrinkRefused,
+    UnknownCategory,
     UnknownSummaryKey,
 )
 
@@ -66,13 +67,25 @@ def _apply_oversized(response: dict, result: dict) -> None:
         "it narrates when things changed, that material belongs in add_update."
     )
 
+
+def _unknown_category(refusal: UnknownCategory) -> dict:
+    """The one refusal both modes share, since both address a slot by category."""
+    return {
+        "written": False,
+        "refused": "unknown_category",
+        "reason": str(refusal),
+        "existing_categories": refusal.known,
+        "hint": "Reuse whichever of these fits, or resend in wholesale mode with "
+                "create_category=true if this really is a new kind of entry.",
+    }
+
 DESCRIPTION = """Write a summary slot — the current state of one topic. THIS IS THE DEFAULT WAY TO UPDATE STORED CONTEXT.
 
 Two shapes, chosen by whether you pass `old_str`:
 
 PATCH — pass `old_str` and `new_str`. Changes one passage and leaves everything else untouched. PREFER THIS whenever the slot already has a value: it sends only the diff instead of making you regenerate a whole document to move one line. `old_str` must appear EXACTLY ONCE; if it appears several times the call is refused rather than guessing, so extend it with surrounding text until it is unique.
 
-WHOLESALE — pass `content` and omit `old_str`. Replaces the slot entirely, or creates it if it does not exist yet. `content` must be the COMPLETE new state, not a fragment — whatever was stored is replaced, so sending only the changed part destroys the rest. A replacement under half the stored length is refused unless you pass `allow_shrink=true`, and opening a NEW key in a category that already has slots needs `create_key=true`.
+WHOLESALE — pass `content` and omit `old_str`. Replaces the slot entirely, or creates it if it does not exist yet. `content` must be the COMPLETE new state, not a fragment — whatever was stored is replaced, so sending only the changed part destroys the rest. A replacement under half the stored length is refused unless you pass `allow_shrink=true`, opening a NEW key in a category that already has slots needs `create_key=true`, and writing to a category that does not exist yet needs `create_category=true`.
 
 Use add_update INSTEAD for point-in-time facts that should accumulate — a decision made, an event, something discovered. Those belong in history, not in a slot that gets overwritten. This is the single most common way a slot bloats: a summary that narrates WHEN things changed is carrying history in the wrong place, and unlike history it is never cleaned up.
 
@@ -87,9 +100,10 @@ def patch_context(
     category: Annotated[
         str,
         Field(
-            description="Which slot to write: tech_stack, architecture, config, or decisions for "
-            "project-scoped entries; preference, fact, tasks, or note for general ones. "
-            "Close typos are auto-corrected."
+            description="Which category the slot lives in. Built in: tech_stack, architecture, "
+            "config, decisions (usually project-scoped); preference, fact, tasks, note (usually "
+            "general). Categories created later are listed by get_index. Close typos are "
+            "auto-corrected; a new name needs create_category=true."
         ),
     ],
     old_str: Annotated[
@@ -150,6 +164,15 @@ def patch_context(
             "first — a near-duplicate key splits a topic in two and nothing later notices."
         ),
     ] = False,
+    create_category: Annotated[
+        bool,
+        Field(
+            description="WHOLESALE MODE. Set true ONLY to create a category that does not exist "
+            "yet. It becomes available to every project, and search can filter on it. Without it "
+            "an unknown category is refused and the existing ones come back. Most new topics are "
+            "a key, not a category — create one only for a new KIND of entry."
+        ),
+    ] = False,
 ) -> dict:
     store = get_store()
 
@@ -181,7 +204,8 @@ def patch_context(
         }
 
     if content is not None:
-        return _wholesale(store, content, category, project, key, tier, allow_shrink, create_key)
+        return _wholesale(store, content, category, project, key, tier, allow_shrink, create_key,
+                          create_category)
 
     try:
         result = store.patch_summary(
@@ -192,6 +216,8 @@ def patch_context(
             key=key,
             source="live",
         )
+    except UnknownCategory as refusal:
+        return {**_unknown_category(refusal), "mode": "patch"}
     except PatchFailed as refusal:
         # Returned, not raised — the caller needs the stored text to build a
         # correct patch, and an exception string alone doesn't carry it. Same
@@ -260,7 +286,8 @@ def patch_context(
     return response
 
 
-def _wholesale(store, content, category, project, key, tier, allow_shrink, create_key) -> dict:
+def _wholesale(store, content, category, project, key, tier, allow_shrink, create_key,
+               create_category) -> dict:
     """
     Replace or create a slot outright — what change_update did before it was
     folded in here.
@@ -280,7 +307,12 @@ def _wholesale(store, content, category, project, key, tier, allow_shrink, creat
             allow_shrink=allow_shrink,
             key=key,
             create_key=create_key,
+            create_category=create_category,
         )
+    except UnknownCategory as refusal:
+        # Caught before ValueError below, which it subclasses — otherwise it
+        # would be reported as a generic invalid_argument without the list.
+        return {**_unknown_category(refusal), "mode": "wholesale"}
     except UnknownSummaryKey as refusal:
         # Returned, not raised: the caller can only avoid fragmenting the
         # category if it can see what is already in it. Ranked closest-first by
@@ -341,6 +373,8 @@ def _wholesale(store, content, category, project, key, tier, allow_shrink, creat
         "category": result["category"],
         "had_previous_value": result.get("previous") is not None,
     }
+    if result.get("category_created"):
+        response["category_created"] = result["category"]
     if result.get("previous") is not None:
         response["replaced_content"] = result["previous"]
         response["archived_id"] = result["archived_id"]

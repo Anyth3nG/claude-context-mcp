@@ -61,9 +61,10 @@ def archive(
     category: Annotated[
         Optional[str],
         Field(
-            description="FINISHED-WORK MODE. Which category the slot lives in: tech_stack, "
-            "architecture, config, decisions for project-scoped entries; preference, fact, "
-            "tasks, note for general ones."
+            description="FINISHED-WORK MODE. Which category the slot lives in. Built in: "
+            "tech_stack, architecture, config, decisions (usually project-scoped); preference, "
+            "fact, tasks, note (usually general); get_index lists every category, including ones "
+            "created later."
         ),
     ] = None,
     key: Annotated[

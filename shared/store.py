@@ -21,10 +21,17 @@ from shared.drivers import ChromaDriver, StorageDriver
 
 COLLECTION_NAME = "context_store"
 
-# Locked taxonomy from docs/schema.md. Extending this is a one-line change
-# here (not a data migration) — but it must be deliberate, not a typo that
-# silently creates an invisible bucket search_context can never filter to.
-VALID_CATEGORIES = {
+# The categories every store starts with — no longer the whole taxonomy. Since
+# 2026-09-16 a category is also valid if anything in the store is filed under
+# it, so a new one is created by writing to it with create_category=True rather
+# than by editing this set. That flag is the whole guard: what the fixed set used
+# to prevent was a typo silently opening a bucket that no filtered search can
+# find, and a deliberate flag prevents that just as well without a deploy.
+#
+# One list for every project, not one per project. A per-project taxonomy would
+# make a category filter mean different things in different places and let each
+# project drift its own spelling of the same idea.
+BUILTIN_CATEGORIES = frozenset({
     "tech_stack",
     "architecture",
     "config",
@@ -33,7 +40,9 @@ VALID_CATEGORIES = {
     "fact",
     "tasks",
     "note",
-}
+})
+# Categories name a kind of thing ("incidents"), not a topic — topics are keys.
+MAX_CATEGORY_CHARS = 30
 VALID_TYPES = {"summary", "chunk"}
 VALID_TIERS = {"client", "personal"}
 
@@ -208,6 +217,27 @@ class UnknownSummaryKey(Exception):
         )
 
 
+class UnknownCategory(ValueError):
+    """
+    Raised instead of guessing at a category that neither exists nor is close
+    to one that does.
+
+    Carries every known category so the caller can pick one, or resend with
+    create_category=True if a new one is really meant. A ValueError subclass so
+    anything already catching a bad category keeps catching it.
+    """
+
+    def __init__(self, category: str, known: list):
+        self.category = category
+        self.known = known
+        super().__init__(
+            f"Unknown category '{category}' — no close match found. "
+            f"Known categories: {', '.join(known)}. Use one of those if it fits. "
+            "To create this one, write to it with create_category=True — it then "
+            "becomes available to every project, not just this one."
+        )
+
+
 class MissingSummaryKey(Exception):
     """
     A summary write arrived without a key.
@@ -316,28 +346,29 @@ class PatchNoOp(PatchFailed):
 DEFAULT_VOYAGE_MODEL = "voyage-3.5"
 
 
-def _normalize_category(category: str) -> tuple[str, Optional[str]]:
+def _slugify_category(category: str) -> str:
     """
-    Returns (normalized_category, corrected_from). corrected_from is None if
-    the input was already valid, otherwise it's the original (wrong) input —
-    so callers can surface that a correction happened rather than silently
-    swallowing it. Raises only when nothing is a close enough match, since
-    guessing at that distance risks filing something under the wrong
-    category with no way to tell.
-    """
-    if category in VALID_CATEGORIES:
-        return category, None
-    import difflib
+    Lowercase, underscore-separated, alphanumerics only.
 
-    matches = difflib.get_close_matches(
-        category, VALID_CATEGORIES, n=1, cutoff=CATEGORY_MATCH_CUTOFF
-    )
-    if matches:
-        return matches[0], category
-    raise ValueError(
-        f"Unknown category '{category}' — no close match found. "
-        f"Valid: {sorted(VALID_CATEGORIES)}"
-    )
+    Underscores, never hyphens: summary ids are `summary-{project}-{category}-{key}`
+    and keys are hyphenated, so a hyphen inside a category would make it
+    impossible to tell where the category ends and the key begins. Anything
+    outside [a-z0-9_] is also barred because DynamoDB sort keys are
+    `#`-delimited strings built from it.
+    """
+    import re
+
+    slug = re.sub(r"[^a-z0-9]+", "_", category.strip().lower()).strip("_")
+    if not slug:
+        raise ValueError(
+            f"Category '{category}' contains nothing usable — categories must have letters or digits."
+        )
+    if len(slug) > MAX_CATEGORY_CHARS:
+        raise ValueError(
+            f"Category '{slug}' is {len(slug)} characters, over the {MAX_CATEGORY_CHARS} limit. "
+            "A category names a kind of entry ('incidents'); a specific topic is a key."
+        )
+    return slug
 
 
 MAX_KEY_CHARS = 40
@@ -570,6 +601,9 @@ class ContextStore:
           embedding_function AND embedding_function_name.
         - Explicit, deliberate opt-out of Voyage: allow_local_fallback=True.
         """
+        # Categories seen in the store, beyond the built-ins. Loaded lazily and
+        # only on a name that is not already known — see _resolve_category.
+        self._categories: Optional[set[str]] = None
         if driver is not None:
             # A backend was supplied outright, so none of the Chroma
             # construction below applies: the driver owns its own connection
@@ -638,6 +672,71 @@ class ContextStore:
                 create_kwargs["embedding_function"] = embedding_function
             return self.client.get_or_create_collection(COLLECTION_NAME, **create_kwargs)
 
+    def known_categories(self, refresh: bool = False) -> list[str]:
+        """
+        Every category a write may use without create_category: the built-ins
+        plus every category anything in the store is filed under, sorted.
+
+        Derived from the data rather than kept in a registry record, so there is
+        no second source of truth to fall out of step — a category exists exactly
+        as long as something is stored under it. The cost is a metadata scan of
+        the whole store, which is why the result is cached for the life of the
+        process and only refreshed on a miss.
+        """
+        if self._categories is None or refresh:
+            found = self.driver.scan({}, with_documents=False)
+            self._categories = {r["metadata"].get("category") for r in found} - {None}
+        return sorted(BUILTIN_CATEGORIES | self._categories)
+
+    def _resolve_category(self, category: str) -> tuple[str, Optional[str]]:
+        """The read-side form of _resolve_category_for_write: never creates."""
+        resolved, corrected_from, _ = self._resolve_category_for_write(category, create=False)
+        return resolved, corrected_from
+
+    def _resolve_category_for_write(
+        self, category: str, create: bool
+    ) -> tuple[str, Optional[str], bool]:
+        """
+        Returns (category, corrected_from, created).
+
+        corrected_from is None if the input named a known category, otherwise
+        it's the original (wrong) input — so callers can surface that a
+        correction happened rather than silently swallowing it. Case, spacing
+        and hyphens are not corrections; they are slugified away unreported, the
+        same as keys.
+
+        The order matters. The cache is refreshed BEFORE falling back to a fuzzy
+        match, because a category created on another machine is invisible to
+        this process until it rescans — and matching against a stale list would
+        "correct" a perfectly valid name into its nearest neighbour.
+
+        `create` bypasses the fuzzy match entirely, the same trade create_key
+        makes: two near-duplicate categories can be merged later, but an entry
+        silently filed under the wrong one cannot be found to move.
+
+        A created category joins the cache at once, before anything is written.
+        update_summary looks the slot up again under the category it just
+        resolved, and that lookup must not rescan, find nothing stored yet, and
+        refuse the name the caller explicitly asked to create. If the write then
+        fails, the name lingers only in this process's cache until the next
+        refresh — nothing durable records it.
+        """
+        slug = _slugify_category(category)
+        if slug in BUILTIN_CATEGORIES or slug in (self._categories or ()):
+            return slug, None, False
+        known = self.known_categories(refresh=True)
+        if slug in known:
+            return slug, None, False
+        if create:
+            self._categories.add(slug)
+            return slug, None, True
+        import difflib
+
+        matches = difflib.get_close_matches(slug, known, n=1, cutoff=CATEGORY_MATCH_CUTOFF)
+        if matches:
+            return matches[0], category, False
+        raise UnknownCategory(category, known)
+
     def save(
         self,
         document: str,
@@ -647,8 +746,11 @@ class ContextStore:
         tier: Optional[str] = None,  # required if project set
         source: str = "live",
         chat_title: Optional[str] = None,
+        create_category: bool = False,
     ):
-        category, corrected_from = _normalize_category(category)
+        category, corrected_from, created = self._resolve_category_for_write(
+            category, create_category
+        )
         if type not in VALID_TYPES:
             raise ValueError(f"type must be one of {VALID_TYPES}, got '{type}'")
 
@@ -683,7 +785,7 @@ class ContextStore:
             metadata["category_corrected_from"] = corrected_from
 
         self.driver.put([{"id": id, "document": document, "metadata": metadata}])
-        return {"id": id, "corrected_from": corrected_from, **metadata}
+        return {"id": id, "corrected_from": corrected_from, "category_created": created, **metadata}
 
     def summary_id(self, project: Optional[str], category: str, key: Optional[str] = None) -> str:
         """
@@ -721,7 +823,7 @@ class ContextStore:
         reads correctly, and a `None` in this list is the signal that it has not
         been migrated rather than a crash.
         """
-        category, _ = _normalize_category(category)
+        category, _ = self._resolve_category(category)
         found = self.driver.scan(
             {"project": project or "general", "category": category, "type": "summary"},
             with_documents=False,
@@ -747,7 +849,7 @@ class ContextStore:
         call) and only runs on the refusal path, where a caller is about to
         create a key and needs to see what it might already be.
         """
-        category, _ = _normalize_category(category)
+        category, _ = self._resolve_category(category)
         existing = self.summary_keys(project, category)
         if not existing:
             return []
@@ -797,6 +899,7 @@ class ContextStore:
         chat_title: Optional[str] = None,
         timestamp: Optional[str] = None,
         key: Optional[str] = None,
+        create_category: bool = False,
     ) -> dict:
         """
         Write several chunks in ONE upsert, and therefore one embedding call.
@@ -826,8 +929,14 @@ class ContextStore:
         widens chunk_id()'s hash so the same text under two keys doesn't
         collapse into one entry; a pile of chunks under a key is never current
         state on its own, only a summary is.
+
+        A CATEGORY, unlike a chunk key, stays gated: `create_category` is needed
+        to open a new one, because a category is shared by every project and is
+        what search filters on.
         """
-        category, corrected_from = _normalize_category(category)
+        category, corrected_from, created = self._resolve_category_for_write(
+            category, create_category
+        )
         project_key = project or "general"
         key = _normalize_key(key)
         if not project:
@@ -875,6 +984,7 @@ class ContextStore:
                 {"id": i, "chars": len(d)} for i, d in zip(ids, docs) if len(d) > MAX_DOC_CHARS
             ],
             "corrected_from": corrected_from,
+            "category_created": created,
             **metadata,
         }
 
@@ -890,7 +1000,7 @@ class ContextStore:
         Returns (document, metadata, embedding) so callers that are about to
         overwrite can archive the old version without re-embedding it.
         """
-        category, _ = _normalize_category(category)
+        category, _ = self._resolve_category(category)
         key = _normalize_key(key)
         # fetch_slot, not fetch: this read is the basis of every read-modify-write
         # in the store (patch, replace, archive), so it must return the caller's
@@ -929,7 +1039,7 @@ class ContextStore:
         filt: dict = {"project": project_key, "type": "summary"}
         corrected_from = None
         if category is not None:
-            category, corrected_from = _normalize_category(category)
+            category, corrected_from = self._resolve_category(category)
             filt["category"] = category
         entries = [
             {
@@ -974,7 +1084,7 @@ class ContextStore:
         is easy to add later against superseded_at, and is not built until
         something actually needs it.
         """
-        category, corrected_from = _normalize_category(category)
+        category, corrected_from = self._resolve_category(category)
         key = _normalize_key(key)
         sid = self.summary_id(project, category, key)
         # superseded_from alone would be correct and ruinously slow. It names no
@@ -1273,7 +1383,7 @@ class ContextStore:
         a patch is editing something that already exists, so re-declaring its
         tier could only introduce a disagreement.
         """
-        category, corrected_from = _normalize_category(category)
+        category, corrected_from = self._resolve_category(category)
         key = _normalize_key(key)
         sid = self.summary_id(project, category, key)
 
@@ -1510,6 +1620,17 @@ class ContextStore:
         for name in archived_only:
             slot(name)
 
+        # The full category list is global even when the index is scoped to one
+        # project — it answers "what may I file under", which does not depend on
+        # the project. An unscoped index has just read every live record anyway,
+        # so it refreshes the cache for free; a scoped one reads a single project
+        # and must not, or it would forget every other project's categories.
+        if not project:
+            self._categories = {
+                r["metadata"].get("category") for r in (*summaries, *chunks, *archived)
+            } - {None}
+        categories = self.known_categories()
+
         for name, entry in projects.items():
             entry["summaries"] = dict(sorted(entry["summaries"].items()))
             if archived_only.get(name):
@@ -1533,6 +1654,7 @@ class ContextStore:
                 toc[name] = row
             return {
                 "projects": toc,
+                "categories": categories,
                 "total_summaries": len(summaries),
                 "total_history_chunks": len(chunks),
                 "next": "get_context(project) for one project's current state, "
@@ -1541,6 +1663,7 @@ class ContextStore:
 
         return {
             "projects": dict(sorted(projects.items())),
+            "categories": categories,
             "total_summaries": len(summaries),
             "total_history_chunks": len(chunks),
         }
@@ -1556,6 +1679,7 @@ class ContextStore:
         allow_shrink: bool = False,
         key: Optional[str] = None,
         create_key: bool = False,
+        create_category: bool = False,
     ):
         """
         Replace one summary slot in place, archiving whatever was there.
@@ -1570,8 +1694,14 @@ class ContextStore:
           3. The old version is archived as a chunk before being overwritten, so
              nothing is ever actually lost — worst case the summary reads wrong
              and the previous version is one query away.
+
+        `create_category` opens a new category, visible to every project. It
+        does not imply create_key: a brand-new category is empty, so its first
+        key needs no flag anyway.
         """
-        category, corrected_from = _normalize_category(category)
+        category, corrected_from, created = self._resolve_category_for_write(
+            category, create_category
+        )
         key = _normalize_key(key)
         if key is None:
             # No keyless "main slot" — see decisions/no-keyless-slots. While a
@@ -1636,6 +1766,7 @@ class ContextStore:
         self.driver.put([{"id": sid, "document": document, "metadata": metadata}])
         return {
             "id": sid,
+            "category_created": created,
             "previous": previous_doc,
             "oversized": _search_visibility(document, previous_doc),
             "archived_id": archived_id,
@@ -1664,7 +1795,7 @@ class ContextStore:
         """
         corrected_from = None
         if category is not None:
-            category, corrected_from = _normalize_category(category)
+            category, corrected_from = self._resolve_category(category)
         top_k = min(top_k, MAX_TOP_K)
 
         filt: dict = {}

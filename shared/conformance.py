@@ -24,7 +24,9 @@ import json
 import json as _json
 
 from shared.store import (
+    BUILTIN_CATEGORIES,
     INDEX_EXCLUDED_SOURCES,
+    MAX_CATEGORY_CHARS,
     MAX_DOC_CHARS,
     MAX_KEY_CHARS,
     PATCH_ARCHIVE_EVERY,
@@ -40,6 +42,7 @@ from shared.store import (
     PatchNoOp,
     PatchSlotMissing,
     SummaryShrinkRefused,
+    UnknownCategory,
     UnknownSummaryKey,
     _normalize_key,
     _split_for_archive,
@@ -107,8 +110,8 @@ def run(make_store) -> None:
             project="ticketing-saas",
             tier="client",
         )
-        print("FAIL: nonsense category was accepted")
-    except ValueError as e:
+        raise AssertionError("nonsense category was accepted")
+    except UnknownCategory as e:
         print(f"OK, rejected: {e}")
 
     print("\n=== Retrieval reflects the UPDATED summary, not the original ===")
@@ -764,5 +767,65 @@ def run(make_store) -> None:
                                tier="personal", key="probe", allow_shrink=True)
     assert res["oversized"] is None, "condensing below the clip must clear the signal"
     print(f"  reported crossing, staying over, and clearing, against a {MAX_DOC_CHARS}-char clip.")
+
+    # Last on purpose: every category this section creates widens the list that
+    # typo correction matches against, and earlier sections assume the built-ins.
+    print("\n=== Categories: created by writing, shared by every project ===")
+    try:
+        store.save_chunks(["An outage."], category="incidents", project="cat-a", tier="personal")
+        raise AssertionError("an unknown category must be refused without create_category")
+    except UnknownCategory as refusal:
+        assert "incidents" not in refusal.known
+        assert BUILTIN_CATEGORIES <= set(refusal.known), "the refusal must list what IS usable"
+    assert store.count(category="incidents") == 0, "a refused write must store nothing"
+
+    res = store.update_summary("Queue backed up for 40 minutes.", category="incidents",
+                               project="cat-a", tier="personal", key="queue-outage",
+                               create_category=True)
+    assert res["category_created"] is True and res["category"] == "incidents"
+
+    # Another project uses it with no flag: the list is global, not per project.
+    res = store.save_chunks(["Disk filled on the worker."], category="incidents",
+                            project="cat-b", tier="client")
+    assert res["category_created"] is False and res["category"] == "incidents"
+
+    # Created categories take part in typo correction like the built-ins.
+    res = store.save_chunks(["Cert expired."], category="incident", project="cat-b", tier="client")
+    assert res["category"] == "incidents" and res["corrected_from"] == "incident", res
+
+    # Case, spacing and hyphens are slugified, not treated as a different name.
+    res = store.save_chunks(["Root cause was a retry storm."], category="Post-Mortems",
+                            create_category=True)
+    assert res["category"] == "post_mortems" and res["corrected_from"] is None, res
+    assert store.save_chunks(["Second one."], category="post mortems")["category"] == "post_mortems"
+
+    # create_category skips fuzzy matching: an explicit new name is kept, never
+    # quietly redirected into its nearest existing neighbour.
+    res = store.save_chunks(["Deliberately close to incidents."], category="incident",
+                            create_category=True)
+    assert res["category"] == "incident" and res["category_created"] is True, res
+
+    # A process that has never seen the category — another machine, a cold
+    # Lambda — must find it in the data rather than refuse or "correct" it.
+    store._categories = None
+    res = store.save_chunks(["Seen from a cold cache."], category="post_mortems")
+    assert res["category"] == "post_mortems" and res["corrected_from"] is None, res
+    assert {"incidents", "post_mortems"} <= set(store.known_categories())
+
+    # get_index advertises the same global list whether scoped or not.
+    assert "incidents" in store.index()["categories"]
+    assert "post_mortems" in store.index(project="cat-a", detail="projects")["categories"], \
+        "a project-scoped index must still show categories that project has never used"
+    assert store.get_brief("cat-a", category="incidents")[0]["key"] == "queue-outage"
+
+    for bad in ("---", "x" * (MAX_CATEGORY_CHARS + 1)):
+        try:
+            store.save_chunks(["nope"], category=bad, create_category=True)
+            raise AssertionError(f"category {bad!r} should have been rejected")
+        except UnknownCategory:
+            raise AssertionError(f"{bad!r} is malformed, not unknown")
+        except ValueError:
+            pass
+    print("  refused unknown, created, shared across projects, corrected, slugified, survived a cold cache.")
 
     print("\nContract satisfied.")

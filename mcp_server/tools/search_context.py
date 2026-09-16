@@ -41,8 +41,9 @@ def search_context(
     category: Annotated[
         Optional[str],
         Field(
-            description="One of tech_stack, architecture, config, decisions (project-scoped) "
-            "or preference, fact, tasks, note (general). Omit to search all categories. "
+            description="Built in: tech_stack, architecture, config, decisions (usually "
+            "project-scoped) or preference, fact, tasks, note (usually general); get_index lists "
+            "every category, including ones created later. Omit to search all categories. "
             "Close typos are auto-corrected."
         ),
     ] = None,

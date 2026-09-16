@@ -38,9 +38,27 @@ General (`project = null`):
 - `tasks` — things that need doing, each under a titled key
 - `note` — anything that doesn't fit the above but is worth keeping
 
-This list is expected to grow. Adding a category is cheap — a one-line change
-to `VALID_CATEGORIES` in `shared/store.py` — but it must be deliberate, not a
-typo that silently creates a bucket filtered queries can never find. Removing
+These eight are the **built-ins** (`BUILTIN_CATEGORIES` in `shared/store.py`),
+not the whole list. Since 2026-09-16 a category is also valid if anything in
+the store is filed under it, and a new one is created with no code change by
+writing to it with `create_category=True` (`add_update`, or `patch_context` in
+wholesale mode). The flag is what keeps creation deliberate — a typo must not
+silently open a bucket filtered queries can never find.
+
+There is **one list for every project**. A category created while working on one
+project is immediately usable, without the flag, from any other. Per-project
+taxonomies were rejected: a category filter would mean different things in
+different places, and each project would drift its own spelling of the same
+idea. `get_index` returns the full list as `categories`, even when scoped to a
+project.
+
+A category names a *kind* of entry you would want to filter search by
+(`incidents`). A new *topic* inside an existing kind is a key, and keys need no
+new category. Names are slugified to lowercase `[a-z0-9_]`, at most 30
+characters — underscores, never hyphens, because summary ids join category and
+key with hyphens.
+
+Removing
 or renaming a category means a migration pass over existing data — see
 `scripts/migrate_goal_to_tasks.py`, which renamed `goal` to `tasks` on
 2026-08-10 and is the reference for how to do it: summaries carry the category
@@ -49,7 +67,7 @@ metadata update, and the existing embedding is reused because the text is
 unchanged.
 
 The project/general grouping above is **guidance, not enforcement**:
-`VALID_CATEGORIES` is one flat set, and any category may be used with or
+categories are one flat set, and any category may be used with or
 without a project. It reflects where each category usually belongs, not a
 constraint the code applies. In practice `tasks` is used project-scoped to hold
 a project's outstanding work — which genuinely belongs to a project — and
@@ -230,17 +248,30 @@ passed through `put()`.)
 
 ## Category enforcement
 
-`category` is checked against a fixed set (`VALID_CATEGORIES` in
-`shared/store.py`). Close typos (e.g. `"desicions"` → `"decisions"`, difflib
-ratio ≥ 0.75) are auto-corrected, not rejected — but the correction is always
-visible: `save()` returns `corrected_from`, `search()` returns
+`category` is checked against the known categories: the built-ins plus every
+category present in the data. The data-derived part is cached per process and
+rescanned whenever a name misses the cache, before any fuzzy matching — so a
+category created from another machine or client is found rather than "corrected"
+into its nearest neighbour. Built-in names never trigger a scan. There is no
+registry record: a category exists exactly as long as something is stored under
+it, so nothing can fall out of step with the data.
+
+Close typos (e.g. `"desicions"` → `"decisions"`, difflib ratio ≥ 0.75) are
+auto-corrected against that full list, created categories included, not
+rejected — but the correction is always visible: `save()` returns `corrected_from`, `search()` returns
 `category_corrected_from`, and a corrected write additionally stores
 `category_corrected_from` in its own metadata. Only genuinely unmatched input
-(no category within the 0.75 threshold) raises an error. This balances two
-things that were in tension: typos are the expected common case (not
-malicious or ambiguous), but a silent correction would just relocate the
+(no category within the 0.75 threshold) raises `UnknownCategory`, which carries
+the known list; the write tools return it as an `unknown_category` refusal. This
+balances two things that were in tension: typos are the expected common case
+(not malicious or ambiguous), but a silent correction would just relocate the
 original problem — an entry filed under a category the caller didn't
 realize was substituted.
+
+`create_category=True` skips the fuzzy match entirely, the same trade
+`create_key` makes: an explicitly requested name is kept even when it sits close
+to an existing one. Two near-duplicate categories can be merged later with a
+migration; an entry silently filed under the wrong one cannot be found to move.
 
 ### Two tiers, not three: summaries are current, everything else is history
 
