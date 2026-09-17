@@ -221,20 +221,47 @@ const css = k => getComputedStyle(document.documentElement).getPropertyValue("--
 // built-ins already own so it never reads as one of them. The old fallback was
 // the patina green, which sat next to tech_stack's teal and looked like it.
 const PALETTE_HUES = [165, 207, 73, 40, 279, 19, 227, 33];
+const HUES = {};   // runtime category -> hue, filled once the data is known
 const catColor = k => {
   const own = css(k); if (own) return own;
-  let hue = Math.floor(rng(k)() * 360);
-  const near = h => PALETTE_HUES.some(p => Math.abs(((hue - p) % 360 + 540) % 360 - 180) < 18);
-  for (let i = 0; i < 12 && near(hue); i++) hue = (hue + 47) % 360;
+  const { h: hue, ring } = HUES[k] ?? { h: Math.floor(rng(k)() * 360), ring: 0 };
   // Six-digit hex, never hsl(): the sky composites alpha by appending two hex
   // digits to the colour, and an hsl() string there is a SyntaxError that
   // kills the whole draw loop — which is exactly what happened on 2026-09-17.
-  const s = .55, l = .68, a = s * Math.min(l, 1 - l);
+  // Two rings: the built-ins' pastel tone, and a deeper one, so two categories
+  // forced close in hue still read as different colours.
+  const s = ring ? .62 : .55, l = ring ? .50 : .68, a = s * Math.min(l, 1 - l);
   const f = n => { const k = (n + hue / 30) % 12;
     return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))).toString(16).padStart(2, "0"); };
   return `#${f(0)}${f(8)}${f(4)}`;
 };
 const P = D.projects;
+/* Place every runtime category's hue as far as possible from everything already
+   coloured — the built-ins and the runtime categories placed before it. A plain
+   "nudge away from the built-ins" loop put career's three categories on one
+   colour: the eight built-ins block most of the wheel, so every nudge ended in
+   the same free gap. Each name still seeds its own starting point, so the
+   result is stable across visits as long as the set of categories is. */
+{
+  const taken = PALETTE_HUES.map(h => ({ h, ring: 0 }));
+  // Distance between two colours: hue apart, plus a bonus when they sit on
+  // different rings — a deep violet and a pastel violet are not the same colour.
+  const dist = (a, b) => Math.abs(((a.h - b.h) % 360 + 540) % 360 - 180) + (a.ring !== b.ring ? 40 : 0);
+  const gap = c => Math.min(...taken.map(t => dist(c, t)));
+  const cats = [...new Set(P.flatMap(p => [...p.slots.map(s => s.cat), ...(p.history || []).map(g => g.cat)]))]
+    .filter(c => !css(c)).sort();
+  for (const c of cats) {
+    const start = rng(c)() * 360;
+    let best = null, bestGap = -1;
+    for (let i = 0; i < 48; i++) {           // golden-angle walk from the seed
+      for (const ring of [0, 1]) {
+        const cand = { h: (start + i * 137.508) % 360, ring }, g = gap(cand);
+        if (g > bestGap) { best = cand; bestGap = g; }
+      }
+    }
+    best.h = Math.round(best.h); HUES[c] = best; taken.push(best);
+  }
+}
 const HINT = "← → travel · drag to pan · scroll to zoom · click a category to name its slots";
 
 $("#tally").innerHTML = `<span><b>${D.totals.projects}</b> constellations</span>` +
