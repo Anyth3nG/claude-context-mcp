@@ -226,7 +226,13 @@ const catColor = k => {
   let hue = Math.floor(rng(k)() * 360);
   const near = h => PALETTE_HUES.some(p => Math.abs(((hue - p) % 360 + 540) % 360 - 180) < 18);
   for (let i = 0; i < 12 && near(hue); i++) hue = (hue + 47) % 360;
-  return `hsl(${hue} 55% 68%)`;
+  // Six-digit hex, never hsl(): the sky composites alpha by appending two hex
+  // digits to the colour, and an hsl() string there is a SyntaxError that
+  // kills the whole draw loop — which is exactly what happened on 2026-09-17.
+  const s = .55, l = .68, a = s * Math.min(l, 1 - l);
+  const f = n => { const k = (n + hue / 30) % 12;
+    return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))).toString(16).padStart(2, "0"); };
+  return `#${f(0)}${f(8)}${f(4)}`;
 };
 const P = D.projects;
 const HINT = "← → travel · drag to pan · scroll to zoom · click a category to name its slots";
