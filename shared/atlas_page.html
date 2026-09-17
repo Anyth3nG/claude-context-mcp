@@ -215,9 +215,19 @@ const el = (t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;
   if(x!==undefined)n.textContent=x;return n;};
 const nf = v => v.toLocaleString();
 const css = k => getComputedStyle(document.documentElement).getPropertyValue("--"+k).trim();
-// Categories can be created at runtime, so one with no palette entry of its own
-// falls back to the neutral colour rather than rendering with none.
-const catColor = k => css(k) || css("patina");
+// Categories can be created at runtime, so most have no palette entry. One that
+// doesn't gets a colour derived from its name — the same every visit, since
+// colour is how you tell categories apart at a glance — nudged off the hues the
+// built-ins already own so it never reads as one of them. The old fallback was
+// the patina green, which sat next to tech_stack's teal and looked like it.
+const PALETTE_HUES = [165, 207, 73, 40, 279, 19, 227, 33];
+const catColor = k => {
+  const own = css(k); if (own) return own;
+  let hue = Math.floor(rng(k)() * 360);
+  const near = h => PALETTE_HUES.some(p => Math.abs(((hue - p) % 360 + 540) % 360 - 180) < 18);
+  for (let i = 0; i < 12 && near(hue); i++) hue = (hue + 47) % 360;
+  return `hsl(${hue} 55% 68%)`;
+};
 const P = D.projects;
 const HINT = "← → travel · drag to pan · scroll to zoom · click a category to name its slots";
 
@@ -509,7 +519,7 @@ function openCat(p){
     p.slots.filter(s=>s.cat===cat).forEach(s=>{
       const b=el("button","slot"), stack=el("div","stack");
       for(let i=0;i<Math.min(s.prior,3);i++) stack.appendChild(el("i"));
-      const face=el("div","face"); face.style.borderTopColor=css(s.cat);
+      const face=el("div","face"); face.style.borderTopColor=catColor(s.cat);
       face.append(el("div","slot-k",s.key||s.cat), el("div","slot-c",s.key?s.cat:"main slot"));
       const m=el("div","slot-m");
       m.innerHTML=`<span>${nf(s.chars)} ch</span>`+
